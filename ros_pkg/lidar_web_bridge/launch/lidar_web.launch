@@ -1,0 +1,23 @@
+<launch>
+  <!-- Existing Livox driver is NOT started or modified here. -->
+  <arg name="topic" default="/livox/lidar" />
+  <arg name="server_host" default="127.0.0.1" />
+  <arg name="server_port" default="8765" />
+  <arg name="point_stride" default="1" />
+  <arg name="max_points" default="0" />
+  <arg name="rviz" default="false" />
+  <arg name="rviz_config"
+       default="$(find lidar_web_bridge)/rviz/lidar_view.rviz" />
+
+  <node name="lidar_web_bridge" pkg="lidar_web_bridge" type="ros_bridge.py"
+        output="screen" respawn="true" respawn_delay="2">
+    <param name="topic" value="$(arg topic)" />
+    <param name="server_host" value="$(arg server_host)" />
+    <param name="server_port" value="$(arg server_port)" />
+    <param name="point_stride" value="$(arg point_stride)" />
+    <param name="max_points" value="$(arg max_points)" />
+  </node>
+
+  <node if="$(arg rviz)" name="rviz" pkg="rviz" type="rviz"
+        args="-d $(arg rviz_config)" output="screen" />
+</launch>

@@ -1,0 +1,18 @@
+<?xml version="1.0"?>
+<package format="2">
+  <name>lidar_web_bridge</name>
+  <version>1.0.0</version>
+  <description>
+    Read-only bridge that forwards Livox PointCloud2 frames to the local
+    LiDAR web dashboard. Does not modify the Livox driver or RViz.
+  </description>
+  <maintainer email="rajesh@localhost">rajesh</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>catkin</buildtool_depend>
+
+  <exec_depend>rospy</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>python-numpy</exec_depend>
+  <exec_depend>rviz</exec_depend>
+</package>

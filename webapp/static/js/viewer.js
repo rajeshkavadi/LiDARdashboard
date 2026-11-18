@@ -17,6 +17,10 @@
   var DEFAULT_CAPACITY = 300000;
   var RING_STEP = 5;        // metres between range rings
   var RING_COUNT = 8;       // 5 m … 40 m
+  var BASE_FOV = 72;        // FRONT/BACK/LEFT/RIGHT field of view at zoom 1
+  var TOP_HALF = 6;         // TOP ortho half-height: the 5 m ring fits the frame
+  var ZOOM_MIN = 0.15;      // 6 / 0.15 = 40 m half-height: the whole ring set
+  var ZOOM_MAX = 8;         // 6 / 8 = 0.75 m half-height at the tightest zoom
 
   var COLOR_STOPS = [
     [0.00, 0.15, 0.29, 0.86],
@@ -54,6 +58,7 @@
     this._lastFrameAt = 0;
     this._frameSeq = 0;
     this._frameCount = 0;
+    this.zoom = 1;
 
     this._initScene();
     this._initBuffers(this.capacity);
@@ -78,13 +83,13 @@
 
     this.scene = new THREE.Scene();
 
-    this.camera = new THREE.PerspectiveCamera(72, width / height, 0.05, 900);
+    this.camera = new THREE.PerspectiveCamera(BASE_FOV, width / height, 0.05, 900);
     this.camera.up.set(0, 0, 1); // ROS convention: X fwd, Y left, Z up
     this.viewCamera = this.camera;
 
     // Orthographic overhead camera for the TOP map: true top-down, so the
     // 5 m range rings stay circular and evenly spaced.
-    var half = 47;
+    var half = TOP_HALF;
     this.topCamera = new THREE.OrthographicCamera(
       -half * (width / height), half * (width / height), half, -half, 0.1, 400
     );
@@ -144,6 +149,7 @@
   PointCloudViewer.prototype._initRangeRings = function () {
     var group = new THREE.Group();
     group.visible = false;
+    this.ringLabels = [];
 
     for (var i = 1; i <= RING_COUNT; i++) {
       var radius = i * RING_STEP;
@@ -164,7 +170,9 @@
       );
       line.renderOrder = 3;
       group.add(line);
-      group.add(this._ringLabel(radius));
+      var label = this._ringLabel(radius);
+      group.add(label);
+      this.ringLabels.push(label);
     }
 
     this.ranges = group;
@@ -194,7 +202,7 @@
     }));
     var angle = Math.PI / 4; // 45° between +X and +Y, clear of the axes
     sprite.position.set(Math.cos(angle) * radius, Math.sin(angle) * radius, 0.05);
-    sprite.scale.set(4.6, 2.3, 1);
+    sprite.scale.set(1.7, 0.85, 1);
     sprite.renderOrder = 4;
     return sprite;
   };
@@ -241,6 +249,33 @@
       this._observer = new ResizeObserver(this._onResize);
       this._observer.observe(this.canvas.parentElement || this.canvas);
     }
+    this._onWheel = function (ev) { self._wheel(ev); };
+    this.canvas.addEventListener('wheel', this._onWheel, { passive: false });
+  };
+
+  /** Wheel zoom for the fixed views; FREE VIEW keeps OrbitControls' dolly. */
+  PointCloudViewer.prototype._wheel = function (ev) {
+    if (!this.active || this.mode === 'free') return;
+    ev.preventDefault();
+    var delta = ev.deltaMode === 1 ? ev.deltaY * 16 : ev.deltaY;
+    this._setZoom(this.zoom * Math.pow(1.0018, -delta));
+  };
+
+  PointCloudViewer.prototype._setZoom = function (zoom) {
+    this.zoom = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, zoom));
+    if (this.mode === 'top') {
+      this.topCamera.zoom = this.zoom;
+      this.topCamera.updateProjectionMatrix();
+      // Keep ring labels the same size on screen at every zoom level.
+      var labels = this.ringLabels || [];
+      for (var i = 0; i < labels.length; i++) {
+        labels[i].scale.set(1.7 / this.zoom, 0.85 / this.zoom, 1);
+      }
+      return;
+    }
+    var fov = 2 * Math.atan(Math.tan(BASE_FOV * Math.PI / 360) / this.zoom) * 180 / Math.PI;
+    this.camera.fov = Math.min(100, Math.max(6, fov));
+    this.camera.updateProjectionMatrix();
   };
 
   PointCloudViewer.prototype.resize = function () {
@@ -250,7 +285,7 @@
     var aspect = width / height;
     this.camera.aspect = aspect;
     this.camera.updateProjectionMatrix();
-    var half = 47;
+    var half = TOP_HALF;
     this.topCamera.left = -half * aspect;
     this.topCamera.right = half * aspect;
     this.topCamera.top = half;
@@ -275,6 +310,7 @@
     this.mode = mode;
     this.ranges.visible = mode === 'top';
     this.camera.up.set(0, 0, 1);
+    this._setZoom(1); // each view starts at its default framing
 
     if (mode === 'top') {
       // Overhead map: +X up the screen, +Y to the left, distance rings on Z=0.

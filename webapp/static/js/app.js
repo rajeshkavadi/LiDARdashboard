@@ -3,11 +3,11 @@
   'use strict';
 
   var VIEW_META = {
-    front: { label: 'FRONT · +X', sub: 'camera at LiDAR origin · looking forward (+X)' },
-    back: { label: 'BACK · −X', sub: 'camera at LiDAR origin · looking backward (−X)' },
-    left: { label: 'LEFT · +Y', sub: 'camera at LiDAR origin · looking left (+Y)' },
-    right: { label: 'RIGHT · −Y', sub: 'camera at LiDAR origin · looking right (−Y)' },
-    top: { label: 'TOP · −Z', sub: 'overhead map · +X up · 5 m distance rings' },
+    front: { label: 'FRONT · +X', sub: 'camera at LiDAR origin · looking forward (+X) · scroll to zoom' },
+    back: { label: 'BACK · −X', sub: 'camera at LiDAR origin · looking backward (−X) · scroll to zoom' },
+    left: { label: 'LEFT · +Y', sub: 'camera at LiDAR origin · looking left (+Y) · scroll to zoom' },
+    right: { label: 'RIGHT · −Y', sub: 'camera at LiDAR origin · looking right (−Y) · scroll to zoom' },
+    top: { label: 'TOP · −Z', sub: 'overhead map · +X up · 5 m rings · scroll to zoom' },
     free: { label: 'FREE VIEW', sub: 'orbit · zoom · pan (camera may move off origin)' }
   };
 

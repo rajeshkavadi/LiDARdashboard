@@ -353,8 +353,10 @@ TOP is a true overhead map: an orthographic camera looks straight down, with
 +X up the screen and +Y to the left. It draws concentric **distance rings on
 the ground plane every 5 m (5, 10, 15 … 40 m)**, each labelled with its radius
 in metres, so you can read range directly off the scene. Rings are shown in
-TOP only and are drawn on top of the points so they stay visible. Switching
-views never reconnects the WebSocket or pauses the stream.
+TOP only and are drawn on top of the points so they stay visible. The default
+framing fits the **5 m ring**, keeping the near field readable; scroll down to
+zoom out and reveal the 10, 15 … 40 m rings as needed. Switching views never
+reconnects the WebSocket or pauses the stream.
 
 FREE VIEW enables OrbitControls: left-drag rotates, wheel zooms, right-drag
 pans. When entering FREE VIEW the camera keeps the current look direction but
@@ -367,6 +369,12 @@ Other controls:
   99th-percentile range of the frame so outliers do not flatten the ramp. The
   legend switches to `DISTANCE` and shows 0 m → max range; intensity has no
   legend because it is a raw 0–255 value.
+- **Zoom** — spin the mouse wheel over the scene. FRONT / BACK / LEFT / RIGHT
+  zoom by narrowing the field of view (the camera stays at the LiDAR origin);
+  TOP zooms the orthographic scale, so the rings spread out but stay circular.
+  Ranges are 0.15× to 8× (0.15× is wide enough to frame the full 40 m ring set)
+  and every view switch resets to the 5 m default framing.
+  In FREE VIEW the wheel is OrbitControls' dolly, as before.
 - **Max points** — 50k / 120k / 250k / unlimited. Frames above the limit are
   decimated with a stride before touching the GPU buffers.
 - HUD — view label, FPS, rendered points, WebSocket and LiDAR indicators.
@@ -400,9 +408,14 @@ colour ramp is the exact range.
 1. With the cloud streaming, click **View → TOP**.
 2. Confirm the readout reads `TOP · −Z`, +X points up the screen and +Y points
    left, and the scene is a top-down map centred on the LiDAR marker.
-3. Confirm the 5 m rings are evenly spaced and labelled `5 m` … `40 m`.
-4. Switch to FRONT: the rings disappear. Switch back to TOP: they return, with
-   the stream still live (FPS/points keep updating).
+3. The default framing shows the 5 m ring; scroll down to reveal `10 m` …
+   `40 m` and confirm the rings are evenly spaced and labelled.
+4. Scroll up over the map: the rings grow and their labels stay attached and
+   readable; scroll back down to see the outer rings again. Confirm the rings
+   stay circular at every zoom level.
+5. Switch to FRONT: the rings disappear and the zoom resets. Switch back to
+   TOP: rings return at the default framing, with the stream still live
+   (FPS/points keep updating).
 
 ### Testing the Distance colour mode
 
@@ -423,6 +436,8 @@ colour ramp is the exact range.
    shows it behind; LEFT/RIGHT show it on the respective side. Ensure the view
    is from the sensor's position (points radiate outward from the centre).
 5. Switch back and forth while watching the FPS counter: it must not pause.
+6. Scroll up/down in FRONT: the scene zooms in/out without the camera moving
+   from the origin (near points stay centred); switching views resets it.
 
 ### Testing FREE VIEW
 

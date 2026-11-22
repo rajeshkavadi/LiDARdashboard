@@ -34,6 +34,9 @@ HELLO_MAGIC = b"LVS1"
 HEADER = struct.Struct("<4sIdIH2x")  # 24 bytes, 2 zero pad bytes
 POINT_BYTES = 16
 ONLY_FIELDS = ("x", "y", "z", "intensity")
+# sensor_msgs/PointField datatype constants -> numpy type codes.
+PF_DTYPES = {1: "i1", 2: "u1", 3: "i2", 4: "u2", 5: "i4", 6: "u4",
+             7: "f4", 8: "f8"}
 
 
 def log(message):
@@ -106,9 +109,25 @@ class PointCloudBridge(object):
         else:
             step = self.point_stride
 
-        offsets = [fields[name].offset for name in ONLY_FIELDS if name in fields]
-        formats = ["<f4" for _ in ONLY_FIELDS if name in fields]
-        names = [name for name in ONLY_FIELDS if name in fields]
+        # Build the structured dtype from each field's declared datatype and
+        # the message endianness.  (The old code reused a list-comprehension
+        # variable that only leaks in Python 2: on Python 3 / Noetic it raised
+        # NameError on every frame, and it assumed every field was float32.)
+        endian = ">" if msg.is_bigendian else "<"
+        names, formats, offsets = [], [], []
+        for fname in ONLY_FIELDS:
+            field = fields.get(fname)
+            if field is None:
+                continue
+            code = PF_DTYPES.get(field.datatype)
+            if code is None:
+                raise ValueError("field %s has unsupported datatype %d"
+                                 % (fname, field.datatype))
+            if fname in ("x", "y", "z") and code[0] != "f":
+                raise ValueError("field %s is not floating point" % fname)
+            names.append(fname)
+            formats.append(endian + code)
+            offsets.append(field.offset)
         dtype = np.dtype({
             "names": names,
             "formats": formats,
@@ -123,8 +142,8 @@ class PointCloudBridge(object):
         out[:, 0] = sliced["x"]
         out[:, 1] = sliced["y"]
         out[:, 2] = sliced["z"]
-        if "intensity" in fields:
-            np.clip(sliced["intensity"], 0.0, 255.0, out=out[:, 3])
+        if "intensity" in names:
+            out[:, 3] = np.clip(sliced["intensity"].astype("<f4"), 0.0, 255.0)
         else:
             out[:, 3] = 0.0
         return out

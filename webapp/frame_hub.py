@@ -61,7 +61,8 @@ class FrameHub(object):
     def __init__(self):
         self._cond = threading.Condition()
         self._frame = None
-        self._seq = 0
+        self._seq = 0          # bridge-supplied seq (resets when the bridge restarts)
+        self._version = 0      # hub-owned, strictly increasing; used to wake clients
         self._count = 0
         self._stamp = 0.0
         self._frame_id = ""
@@ -88,6 +89,7 @@ class FrameHub(object):
         with self._cond:
             self._frame = frame_bytes
             self._seq = seq
+            self._version += 1
             self._count = count
             self._stamp = stamp
             self._frame_id = frame_id
@@ -96,17 +98,25 @@ class FrameHub(object):
             self._arrivals.append(now)
             self._cond.notify_all()
 
-    def wait_for_frame(self, last_seq, timeout=1.0):
-        """Block until a frame newer than ``last_seq`` exists.
+    def wait_for_frame(self, last_version, timeout=1.0):
+        """Block until a frame newer than ``last_version`` exists.
 
-        Returns ``(frame_bytes, seq)`` or ``(None, last_seq)`` on timeout.
+        ``last_version`` is the hub's own counter (returned by the previous
+        call, 0 initially), not the bridge seq: the bridge seq restarts at 1
+        whenever the bridge restarts, which would stall every open client.
+
+        Returns ``(frame_bytes, version)`` or ``(None, last_version)`` on
+        timeout.  Always blocks while no new frame exists, so the WebSocket
+        loop never busy-spins.
         """
+        deadline = time.time() + timeout
         with self._cond:
-            if self._seq <= last_seq and self._frame is None:
-                self._cond.wait(timeout)
-            if self._seq <= last_seq:
-                return None, last_seq
-            return self._frame, self._seq
+            while self._version <= last_version:
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    return None, last_version
+                self._cond.wait(remaining)
+            return self._frame, self._version
 
     # -- bridge metadata ------------------------------------------------
     def set_bridge_hello(self, meta):

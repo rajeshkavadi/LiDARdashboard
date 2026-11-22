@@ -52,13 +52,13 @@ def points_socket(ws):
     skips frames instead of building a backlog, and cannot slow down ingest.
     """
     hub.client_connected()
-    last_seq = 0
+    last_version = 0
     try:
         while True:
-            frame, seq = hub.wait_for_frame(last_seq, timeout=1.0)
+            frame, version = hub.wait_for_frame(last_version, timeout=1.0)
             if frame is None:
                 continue
-            last_seq = seq
+            last_version = version
             ws.send(frame)
             hub.add_bytes_sent(len(frame))
     except Exception as exc:  # noqa: BLE001 - any socket error means the client left

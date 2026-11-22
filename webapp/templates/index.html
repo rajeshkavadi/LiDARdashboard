@@ -152,6 +152,15 @@ rostopic hz /livox/lidar</code></pre>
               <option value="0">Unlimited</option>
             </select>
           </label>
+          <label title="Merge the last N frames (static sensor only — smears when moving)">Accumulate
+            <select id="accumulate">
+              <option value="1">Off (1 frame)</option>
+              <option value="5">5 frames · 0.5 s</option>
+              <option value="10" selected>10 frames · 1 s</option>
+              <option value="20">20 frames · 2 s</option>
+              <option value="30">30 frames · 3 s</option>
+            </select>
+          </label>
         </div>
       </div>
 

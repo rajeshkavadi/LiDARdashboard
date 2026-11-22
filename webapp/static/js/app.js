@@ -46,6 +46,7 @@
       setView: function () {},
       setColorMode: function () {},
       setMaxPoints: function () {},
+      setAccumulation: function () {},
       applyFrame: function () { return false; }
     };
   }
@@ -324,6 +325,10 @@
 
     $('max-points').addEventListener('change', function () {
       viewer.setMaxPoints(parseInt(this.value, 10) || 0);
+    });
+
+    $('accumulate').addEventListener('change', function () {
+      viewer.setAccumulation(parseInt(this.value, 10) || 1);
     });
 
     statsTick = setInterval(function () {

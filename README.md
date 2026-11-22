@@ -375,8 +375,14 @@ Other controls:
   Ranges are 0.15× to 8× (0.15× is wide enough to frame the full 40 m ring set)
   and every view switch resets to the 5 m default framing.
   In FREE VIEW the wheel is OrbitControls' dolly, as before.
-- **Max points** — 50k / 120k / 250k / unlimited. Frames above the limit are
+- **Max points** — 50k / 120k / 250k / unlimited. Caps the whole displayed
+  (accumulated) cloud: each frame gets `max points / accumulate` and is
   decimated with a stride before touching the GPU buffers.
+- **Accumulate** — merges the last 1 / 5 / 10 / 20 / 30 frames (default 10 ≈
+  1 s at the driver's 10 Hz). The Mid-360's non-repetitive scan covers only part
+  of its field of view per 100 ms frame, so a single frame looks sparse.
+  Points are in the sensor frame: accumulation is valid **only while the sensor
+  is stationary**; on a moving platform it smears and needs SLAM poses instead.
 - HUD — view label, FPS, rendered points, WebSocket and LiDAR indicators.
 - Scene — colored points, XY reference grid, RGB axes (X red, Y green,
   Z blue), LiDAR origin marker.

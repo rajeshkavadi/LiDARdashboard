@@ -14,7 +14,6 @@
   var MAGIC = 0x3150564c; // "LVP1" little endian
   var HEADER_SIZE = 24;
   var POINT_BYTES = 16;
-  var DEFAULT_CAPACITY = 300000;
   var RING_STEP = 5;        // metres between range rings
   var RING_COUNT = 8;       // 5 m … 40 m
   var BASE_FOV = 72;        // FRONT/BACK/LEFT/RIGHT field of view at zoom 1
@@ -44,8 +43,9 @@
     this.mode = 'front';
     this.colorMode = 'height';
     this.maxPoints = 120000;
+    this.accumFrames = 10;    // frames merged into the displayed cloud (1 = off)
+    this._filled = 0;         // slots currently holding a frame
     this.active = true;
-    this.capacity = DEFAULT_CAPACITY;
     this.drawn = 0;
     this.zMin = -2;
     this.zMax = 6;
@@ -61,7 +61,8 @@
     this.zoom = 1;
 
     this._initScene();
-    this._initBuffers(this.capacity);
+    this._initBuffers();
+    this.setAccumulation(this.accumFrames);
     this._bind();
     this.setView('front');
     this._loop();
@@ -207,38 +208,118 @@
     return sprite;
   };
 
-  PointCloudViewer.prototype._initBuffers = function (capacity) {
-    this.capacity = capacity;
-    if (this.points) {
-      this.scene.remove(this.points);
-      this.points.geometry.dispose();
-      this.points.material.dispose();
-    }
-
-    this.positions = new Float32Array(capacity * 3);
-    this.colors = new Float32Array(capacity * 3);
-
-    var geometry = new THREE.BufferGeometry();
-    this.positionAttr = new THREE.BufferAttribute(this.positions, 3);
-    this.colorAttr = new THREE.BufferAttribute(this.colors, 3);
-    this.positionAttr.setUsage(THREE.DynamicDrawUsage);
-    this.colorAttr.setUsage(THREE.DynamicDrawUsage);
-    geometry.setAttribute('position', this.positionAttr);
-    geometry.setAttribute('color', this.colorAttr);
-    geometry.setDrawRange(0, 0);
-
-    var material = new THREE.PointsMaterial({
+  /**
+   * Point storage is a RING of per-frame GPU buffers ("slots"), one slot per
+   * accumulated frame.  A new frame overwrites only the oldest slot, so each
+   * frame colours and uploads just its own ~20k points instead of re-uploading
+   * the whole accumulated cloud.  All slots share one material.
+   */
+  PointCloudViewer.prototype._initBuffers = function () {
+    this.material = new THREE.PointsMaterial({
       size: 0.075,
       sizeAttenuation: true,
       vertexColors: true,
       transparent: false,
       depthWrite: true
     });
+    this._slots = [];
+    this._next = 0;   // slot that receives the next frame
+  };
 
-    this.points = new THREE.Points(geometry, material);
-    this.points.frustumCulled = false;
-    this.points.renderOrder = 2;
-    this.scene.add(this.points);
+  PointCloudViewer.prototype._makeSlot = function () {
+    var geometry = new THREE.BufferGeometry();
+    geometry.setDrawRange(0, 0);
+    var points = new THREE.Points(geometry, this.material);
+    points.frustumCulled = false;
+    points.renderOrder = 2;
+    this.scene.add(points);
+    return { points: points, data: null, count: 0, capacity: 0, pos: null, col: null };
+  };
+
+  PointCloudViewer.prototype._disposeSlot = function (slot) {
+    this.scene.remove(slot.points);
+    slot.points.geometry.dispose();
+  };
+
+  /** Copy one frame (Float32Array of x, y, z, intensity) into a slot. */
+  PointCloudViewer.prototype._fillSlot = function (slot, data) {
+    var n = data.length / 4;
+    if (n > slot.capacity) {
+      // Grow: new geometry, and dispose the old one so its GL buffers are freed.
+      var cap = Math.max(n, Math.ceil(slot.capacity * 1.5), 1024);
+      slot.pos = new Float32Array(cap * 3);
+      slot.col = new Float32Array(cap * 3);
+      slot.capacity = cap;
+      var geometry = new THREE.BufferGeometry();
+      var pa = new THREE.BufferAttribute(slot.pos, 3);
+      var ca = new THREE.BufferAttribute(slot.col, 3);
+      pa.setUsage(THREE.DynamicDrawUsage);
+      ca.setUsage(THREE.DynamicDrawUsage);
+      geometry.setAttribute('position', pa);
+      geometry.setAttribute('color', ca);
+      var old = slot.points.geometry;
+      slot.points.geometry = geometry;
+      old.dispose();
+    }
+    var pos = slot.pos;
+    for (var p = 0, s = 0, d = 0; p < n; p++, s += 4, d += 3) {
+      pos[d] = data[s];
+      pos[d + 1] = data[s + 1];
+      pos[d + 2] = data[s + 2];
+    }
+    slot.data = data;
+    slot.count = n;
+    var g = slot.points.geometry;
+    var posAttr = g.getAttribute('position');
+    posAttr.updateRange.offset = 0;
+    posAttr.updateRange.count = n * 3;
+    posAttr.needsUpdate = true;
+    g.setDrawRange(0, n);
+    this._colorSlot(slot);
+  };
+
+  /** (Re)compute a slot's colours with the current colour mode and range. */
+  PointCloudViewer.prototype._colorSlot = function (slot) {
+    if (!slot.data) return;
+    var src = slot.data;
+    var col = slot.col;
+    var n = slot.count;
+    var span = this.zMax - this.zMin;
+    if (!(span > 0.001)) span = 0.001;
+    var invSpan = 1 / span;
+    var invDist = 1 / (this.dMax > 0.5 ? this.dMax : 1);
+    var heightMode = this.colorMode === 'height';
+    var distanceMode = this.colorMode === 'distance';
+    for (var p = 0, si = 0, di = 0; p < n; p++, si += 4, di += 3) {
+      var t;
+      if (heightMode) {
+        t = (src[si + 2] - this.zMin) * invSpan;
+      } else if (distanceMode) {
+        var dx = src[si];
+        var dy = src[si + 1];
+        var dz = src[si + 2];
+        t = Math.sqrt(dx * dx + dy * dy + dz * dz) * invDist;
+      } else {
+        t = src[si + 3] / 255;
+      }
+      if (t < 0) t = 0; else if (t > 1) t = 1;
+      this._ramp(t, col, di);
+    }
+    var colAttr = slot.points.geometry.getAttribute('color');
+    colAttr.updateRange.offset = 0;
+    colAttr.updateRange.count = n * 3;
+    colAttr.needsUpdate = true;
+  };
+
+  PointCloudViewer.prototype._countDrawn = function () {
+    var drawn = 0;
+    var filled = 0;
+    for (var i = 0; i < this._slots.length; i++) {
+      drawn += this._slots[i].count;
+      if (this._slots[i].data) filled += 1;
+    }
+    this.drawn = drawn;
+    this._filled = filled;
   };
 
   PointCloudViewer.prototype._bind = function () {
@@ -342,10 +423,49 @@
   PointCloudViewer.prototype.setColorMode = function (mode) {
     this.colorMode = mode;
     this._rangeReady = false;
+    // Recolour the frames already on screen so the whole cloud switches at once.
+    for (var i = 0; i < this._slots.length; i++) this._colorSlot(this._slots[i]);
   };
 
   PointCloudViewer.prototype.setMaxPoints = function (limit) {
-    this.maxPoints = limit;
+    this.maxPoints = limit;   // applies to frames received from now on
+  };
+
+  /**
+   * Accumulation window.  The Mid-360 scan pattern is non-repetitive, so one
+   * 100 ms frame covers only part of the field of view; showing the last N
+   * frames together fills it in.  Points are in the SENSOR frame, so this is
+   * only correct while the sensor is stationary — on a moving sensor it smears.
+   */
+  PointCloudViewer.prototype.setAccumulation = function (frames) {
+    var n = Math.max(1, frames | 0);
+    // Frames currently held, oldest -> newest.
+    var held = [];
+    var len = this._slots.length;
+    for (var k = 0; k < len; k++) {
+      var slot = this._slots[(this._next + k) % len];
+      if (slot.data) held.push(slot.data);
+    }
+    held = held.slice(Math.max(0, held.length - n));
+    for (var i = 0; i < len; i++) this._disposeSlot(this._slots[i]);
+    this._slots = [];
+    for (var j = 0; j < n; j++) this._slots.push(this._makeSlot());
+    for (var h = 0; h < held.length; h++) this._fillSlot(this._slots[h], held[h]);
+    this._next = held.length % n;
+    this.accumFrames = n;
+    this._countDrawn();
+    this._emitStats();
+  };
+
+  PointCloudViewer.prototype.clearAccumulation = function () {
+    for (var i = 0; i < this._slots.length; i++) {
+      var slot = this._slots[i];
+      slot.data = null;
+      slot.count = 0;
+      slot.points.geometry.setDrawRange(0, 0);
+    }
+    this._next = 0;
+    this._countDrawn();
   };
 
   /* ------------------------------ data path ----------------------------- */
@@ -361,59 +481,30 @@
     if (!total || dataOffset + total * POINT_BYTES > buffer.byteLength) return false;
 
     var src = new Float32Array(buffer, dataOffset, total * 4);
-    var stride = this.maxPoints > 0 ? Math.ceil(total / this.maxPoints) : 1;
-    var count = Math.ceil(total / stride);
-
-    if (count > this.capacity) {
-      this._initBuffers(Math.max(count, this.capacity * 2));
-    }
-
-    var dst = this.positions;
-    var col = this.colors;
+    // Max points caps the whole accumulated cloud, so each frame gets an
+    // equal share of the budget: maxPoints / accumFrames.
+    var budget = this.maxPoints > 0 ? Math.max(1, Math.floor(this.maxPoints / this.accumFrames)) : 0;
+    var stride = budget > 0 ? Math.ceil(total / budget) : 1;
+    var kept = Math.ceil(total / stride);
 
     if (this.colorMode !== 'intensity') {
       this._updateRange(src, total, stride);
     }
 
-    var span = this.zMax - this.zMin;
-    if (!(span > 0.001)) span = 0.001;
-    var invSpan = 1 / span;
-    var invDist = 1 / (this.dMax > 0.5 ? this.dMax : 1);
-    var heightMode = this.colorMode === 'height';
-    var distanceMode = this.colorMode === 'distance';
-
-    for (var i = 0, s = 0; i < count; i++, s += stride) {
-      var si = s * 4;
-      var di = i * 3;
-      dst[di] = src[si];
-      dst[di + 1] = src[si + 1];
-      dst[di + 2] = src[si + 2];
-
-      var t;
-      if (heightMode) {
-        t = (src[si + 2] - this.zMin) * invSpan;
-      } else if (distanceMode) {
-        var dx = src[si];
-        var dy = src[si + 1];
-        var dz = src[si + 2];
-        t = Math.sqrt(dx * dx + dy * dy + dz * dz) * invDist;
-      } else {
-        t = src[si + 3] / 255;
-      }
-      if (t < 0) t = 0; else if (t > 1) t = 1;
-      this._ramp(t, col, di);
+    // Keep a decimated copy of x, y, z, intensity (the WebSocket buffer is
+    // not retained) and write it into the oldest slot of the ring.
+    var copy = new Float32Array(kept * 4);
+    for (var k = 0, s4 = 0; k < kept; k++, s4 += stride * 4) {
+      var c4 = k * 4;
+      copy[c4] = src[s4];
+      copy[c4 + 1] = src[s4 + 1];
+      copy[c4 + 2] = src[s4 + 2];
+      copy[c4 + 3] = src[s4 + 3];
     }
+    this._fillSlot(this._slots[this._next], copy);
+    this._next = (this._next + 1) % this._slots.length;
+    this._countDrawn();
 
-    var geometry = this.points.geometry;
-    this.positionAttr.updateRange.offset = 0;
-    this.positionAttr.updateRange.count = count * 3;
-    this.positionAttr.needsUpdate = true;
-    this.colorAttr.updateRange.offset = 0;
-    this.colorAttr.updateRange.count = count * 3;
-    this.colorAttr.needsUpdate = true;
-    geometry.setDrawRange(0, count);
-
-    this.drawn = count;
     this._frameSeq = view.getUint32(16, true);
     this._frameCount += 1;
     this._lastFrameAt = performance.now();
@@ -490,6 +581,7 @@
       zMin: this.zMin,
       zMax: this.zMax,
       frames: this._frameCount,
+      accumulated: this._filled,
       seq: this._frameSeq,
       age: this._lastFrameAt ? (performance.now() - this._lastFrameAt) / 1000 : null
     });

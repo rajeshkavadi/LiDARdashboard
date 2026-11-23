@@ -80,6 +80,7 @@ class FrameHub(object):
             "message_type": None,
             "master_uri": os.environ.get("ROS_MASTER_URI", ""),
             "pid": None,
+            "imu": {},
         }
 
     # -- ingest ---------------------------------------------------------
@@ -115,6 +116,8 @@ class FrameHub(object):
             self._bridge["message_type"] = meta.get("message_type")
             self._bridge["master_uri"] = meta.get("master_uri") or self._bridge["master_uri"]
             self._bridge["pid"] = meta.get("pid")
+            if isinstance(meta.get("imu"), dict):
+                self._bridge["imu"] = meta["imu"]
 
     def set_bridge_connected(self, connected, peer=None):
         with self._cond:
@@ -170,6 +173,7 @@ class FrameHub(object):
                     "message_type": self._bridge["message_type"],
                     "pid": self._bridge["pid"],
                     "subscribers": self._bridge.get("subscriber_count"),
+                    "imu": self._bridge.get("imu", {}),
                     "lidar_active": bool(age is not None and age < LIDAR_TIMEOUT_S),
                 },
                 "cloud": {

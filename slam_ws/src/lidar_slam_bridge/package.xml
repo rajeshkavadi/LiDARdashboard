@@ -1,0 +1,22 @@
+<?xml version="1.0"?>
+<package format="2">
+  <name>lidar_slam_bridge</name>
+  <version>1.0.0</version>
+  <description>
+    Adapter nodes around FAST-LIO2: converts the existing Livox PointCloud2
+    (with real per-point timestamps) to livox_ros_driver/CustomMsg, and streams
+    the registered global map, pose and trajectory to the web dashboard.
+    Does not modify the Livox driver or RViz.
+  </description>
+  <maintainer email="rajesh@example.com">rajesh</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>catkin</buildtool_depend>
+  <build_depend>rospy</build_depend>
+  <exec_depend>rospy</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>nav_msgs</exec_depend>
+  <exec_depend>std_msgs</exec_depend>
+  <exec_depend>livox_ros_driver</exec_depend>
+  <exec_depend>python-numpy</exec_depend>
+</package>

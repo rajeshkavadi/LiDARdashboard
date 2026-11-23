@@ -1,0 +1,2 @@
+- setup-file:
+    local-name: /home/rajesh/rviz_web_app/slam_ws/install/setup.sh

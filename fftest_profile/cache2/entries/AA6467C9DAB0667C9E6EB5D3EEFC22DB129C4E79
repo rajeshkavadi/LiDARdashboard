@@ -1,0 +1,318 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>LiDAR Live · Livox Mid-360</title>
+  <link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark"></span>
+      <div class="brand-text">
+        <strong>LIDAR<span>LIVE</span></strong>
+        <small>Livox · ROS Melodic · Three.js</small>
+      </div>
+    </div>
+    <nav class="tabs" role="tablist">
+      <button class="tab active" data-tab="dashboard" role="tab">Dashboard</button>
+      <button class="tab" data-tab="rviz" role="tab">RViz</button>
+      <button class="tab" data-tab="view" role="tab">View</button>
+      <button class="tab" data-tab="dem" role="tab">DEM</button>
+    </nav>
+    <div class="topbar-status">
+      <span class="pill" id="pill-lidar"><i class="dot"></i>LiDAR</span>
+      <span class="pill" id="pill-slam"><i class="dot"></i>SLAM</span>
+      <span class="pill" id="pill-ws"><i class="dot"></i>WebSocket</span>
+    </div>
+  </header>
+
+  <main>
+    <!-- ===================== DASHBOARD ===================== -->
+    <section class="tab-panel active" id="tab-dashboard">
+      <div class="panel-head">
+        <h1>System Dashboard</h1>
+        <p>Live status of the LiDAR, IMU, ROS bridge, FAST-LIO2 mapping, DEM processing and remote access.</p>
+      </div>
+
+      <div class="card-grid">
+        <article class="card" id="card-lidar">
+          <div class="card-head"><h2>LiDAR</h2><span class="badge" id="badge-lidar">—</span></div>
+          <div class="metric" id="metric-lidar">Waiting</div>
+          <dl class="kv">
+            <div><dt>Topic</dt><dd id="kv-topic">—</dd></div>
+            <div><dt>Message</dt><dd id="kv-type">—</dd></div>
+            <div><dt>Frame</dt><dd id="kv-frame">—</dd></div>
+            <div><dt>Last frame</dt><dd id="kv-age">—</dd></div>
+          </dl>
+        </article>
+
+        <article class="card">
+          <div class="card-head"><h2>IMU</h2><span class="badge" id="badge-imu">—</span></div>
+          <div class="metric" id="metric-imu">Waiting</div>
+          <dl class="kv">
+            <div><dt>Topic</dt><dd id="kv-imu-topic">—</dd></div>
+            <div><dt>Rate</dt><dd id="kv-imu-rate">—</dd></div>
+            <div><dt>Last sample</dt><dd id="kv-imu-age">—</dd></div>
+            <div><dt>Frame</dt><dd id="kv-imu-frame">—</dd></div>
+          </dl>
+        </article>
+
+        <article class="card">
+          <div class="card-head"><h2>ROS Bridge</h2><span class="badge" id="badge-ros">—</span></div>
+          <div class="metric" id="metric-ros">Waiting</div>
+          <dl class="kv">
+            <div><dt>Master</dt><dd id="kv-master">—</dd></div>
+            <div><dt>Ingest</dt><dd id="kv-ingest">—</dd></div>
+            <div><dt>Bridge PID</dt><dd id="kv-pid">—</dd></div>
+          </dl>
+        </article>
+
+        <article class="card">
+          <div class="card-head"><h2>Point-Cloud Stream</h2><span class="badge" id="badge-stream">—</span></div>
+          <div class="metric"><span id="metric-fps">0.0</span><small>fps</small></div>
+          <dl class="kv">
+            <div><dt>Points / frame</dt><dd id="kv-points">0</dd></div>
+            <div><dt>Frame size</dt><dd id="kv-framesize">—</dd></div>
+            <div><dt>Frames received</dt><dd id="kv-total">0</dd></div>
+            <div><dt>Sent to browsers</dt><dd id="kv-sent">—</dd></div>
+          </dl>
+        </article>
+
+        <article class="card">
+          <div class="card-head"><h2>WebSocket</h2><span class="badge" id="badge-ws">—</span></div>
+          <div class="metric" id="metric-ws">Disconnected</div>
+          <dl class="kv">
+            <div><dt>Browser clients</dt><dd id="kv-clients">0</dd></div>
+            <div><dt>Endpoints</dt><dd>/ws/points · /ws/map · /ws/dem</dd></div>
+            <div><dt>Protocol</dt><dd id="kv-wsproto">—</dd></div>
+          </dl>
+        </article>
+
+        <article class="card">
+          <div class="card-head"><h2>FAST-LIO2 SLAM</h2><span class="badge" id="badge-slam">—</span></div>
+          <div class="metric" id="metric-slam">Offline</div>
+          <dl class="kv">
+            <div><dt>Odometry</dt><dd id="kv-slam-status">—</dd></div>
+            <div><dt>Sensor X / Y / Z</dt><dd id="kv-slam-pose">—</dd></div>
+            <div><dt>Trajectory</dt><dd id="kv-slam-traj">—</dd></div>
+            <div><dt>Pose age</dt><dd id="kv-slam-age">—</dd></div>
+          </dl>
+        </article>
+
+        <article class="card">
+          <div class="card-head"><h2>Global Map</h2><span class="badge" id="badge-map">—</span></div>
+          <div class="metric" id="metric-map">0 <small>pts</small></div>
+          <dl class="kv">
+            <div><dt>Spatial tiles</dt><dd id="kv-map-tiles">0</dd></div>
+            <div><dt>Trajectory points</dt><dd id="kv-map-traj-pts">0</dd></div>
+            <div><dt>Dropped (memory cap)</dt><dd id="kv-map-dropped">0</dd></div>
+            <div><dt>Map memory cap</dt><dd id="kv-map-cap">—</dd></div>
+          </dl>
+          <p class="hint">Incremental tiles from FAST-LIO2; complete map is never re-sent per frame.</p>
+        </article>
+
+        <article class="card">
+          <div class="card-head"><h2>DEM</h2><span class="badge" id="badge-dem">—</span></div>
+          <div class="metric" id="metric-dem">Idle</div>
+          <dl class="kv">
+            <div><dt>Resolution</dt><dd id="kv-dem-res">—</dd></div>
+            <div><dt>Ground points</dt><dd id="kv-dem-ground">0</dd></div>
+            <div><dt>Completed tiles</dt><dd id="kv-dem-tiles">0</dd></div>
+            <div><dt>Elevation range</dt><dd id="kv-dem-range">—</dd></div>
+            <div><dt>Coordinates</dt><dd id="kv-dem-mode">LOCALIZED</dd></div>
+          </dl>
+        </article>
+
+        <article class="card">
+          <div class="card-head"><h2>Cloudflare Tunnel</h2><span class="badge" id="badge-tunnel">—</span></div>
+          <div class="metric" id="metric-tunnel">Unknown</div>
+          <dl class="kv">
+            <div><dt>State</dt><dd id="kv-tunnel-state">—</dd></div>
+            <div><dt>Public URL</dt><dd id="kv-tunnel-url">—</dd></div>
+            <div><dt>Local URL</dt><dd><a id="kv-local" href="/">—</a></dd></div>
+          </dl>
+          <p class="hint" id="tunnel-hint">Tunnel is independent of ROS, SLAM and the LiDAR stream.</p>
+        </article>
+
+        <article class="card">
+          <div class="card-head"><h2>RViz</h2><span class="badge" id="badge-rviz">—</span></div>
+          <div class="metric" id="metric-rviz">Unknown</div>
+          <p class="hint">RViz runs natively and is not affected by this dashboard.</p>
+        </article>
+      </div>
+    </section>
+
+    <!-- ===================== RVIZ ===================== -->
+    <section class="tab-panel" id="tab-rviz">
+      <div class="panel-head">
+        <h1>RViz</h1>
+        <p>The native RViz workflow is unchanged. This tab documents and monitors it — the browser viewer never replaces RViz.</p>
+      </div>
+
+      <div class="rviz-layout">
+        <article class="card">
+          <div class="card-head"><h2>RViz Process</h2><span class="badge" id="badge-rviz-tab">—</span></div>
+          <div class="metric" id="metric-rviz-tab">Unknown</div>
+          <p class="hint">Detected from the local process list. RViz may be running on the LiDAR machine's desktop.</p>
+        </article>
+
+        <article class="panel">
+          <h2>Launch RViz with the LiDAR view</h2>
+          <pre><code>rviz -d ~/rviz_web_app/ros_pkg/lidar_web_bridge/rviz/lidar_view.rviz</code></pre>
+          <p>The config uses Fixed Frame <code>livox_frame</code> and a PointCloud2 display on <code>/livox/lidar</code>, colored by Z with size 2.</p>
+
+          <h2>Existing workflow</h2>
+          <pre><code>roslaunch lidar_web_bridge lidar_web.launch rviz:=true</code></pre>
+          <p>This starts the bridge node and RViz. Your existing Livox driver keeps publishing to <code>/livox/lidar</code>; nothing in the driver is changed.</p>
+
+          <h2>Point-cloud topic check</h2>
+          <pre><code>rostopic info /livox/lidar
+rostopic hz /livox/lidar
+rostopic hz /livox/imu</code></pre>
+        </article>
+      </div>
+    </section>
+
+    <!-- ===================== VIEW ===================== -->
+    <section class="tab-panel" id="tab-view">
+      <div class="view-toolbar">
+        <div class="mode-toggle" role="group" aria-label="Display mode">
+          <button class="mode-btn active" data-mode="live">LIVE VIEW</button>
+          <button class="mode-btn" data-mode="global">GLOBAL MAP</button>
+        </div>
+        <div class="view-buttons" role="group" aria-label="Camera view">
+          <button class="view-btn" data-view="front" title="Camera at sensor origin, facing +X">FRONT</button>
+          <button class="view-btn" data-view="back" title="Camera at sensor origin, facing -X">BACK</button>
+          <button class="view-btn" data-view="left" title="Camera at sensor origin, facing +Y">LEFT</button>
+          <button class="view-btn" data-view="right" title="Camera at sensor origin, facing -Y">RIGHT</button>
+          <button class="view-btn" data-view="top" title="Overhead map with 5 m distance rings in LIVE">TOP</button>
+          <button class="view-btn" data-view="free" title="Orbit, zoom and pan freely">FREE VIEW</button>
+        </div>
+        <div class="view-options">
+          <label>Color
+            <select id="color-mode">
+              <option value="height">Height (Z)</option>
+              <option value="intensity">Intensity</option>
+              <option value="distance">Distance</option>
+            </select>
+          </label>
+          <label id="live-max-wrap">Max points
+            <select id="max-points">
+              <option value="50000">50k</option>
+              <option value="120000" selected>120k</option>
+              <option value="250000">250k</option>
+              <option value="0">Unlimited</option>
+            </select>
+          </label>
+          <label id="map-max-wrap" class="hidden">Map budget
+            <select id="map-max-points">
+              <option value="250000">250k</option>
+              <option value="500000">500k</option>
+              <option value="1000000" selected>1M</option>
+              <option value="2000000">2M</option>
+              <option value="0">Unlimited</option>
+            </select>
+          </label>
+          <div class="map-tools hidden" id="map-tools">
+            <a class="tool-btn" id="map-export" href="/api/map/export.pcd">Export PCD</a>
+            <button class="tool-btn danger" id="map-reset">Reset map</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="canvas-wrap" id="canvas-wrap">
+        <canvas id="cloud-canvas"></canvas>
+        <div class="hud hud-top-left">
+          <span class="view-readout" id="view-readout">FRONT · +X</span>
+          <span class="hud-sub" id="view-sub">camera at LiDAR origin</span>
+        </div>
+        <div class="hud hud-top-right">
+          <span class="hud-stat"><b id="view-fps">0.0</b> fps</span>
+          <span class="hud-stat"><b id="view-points">0</b> pts</span>
+          <span class="hud-stat"><b id="map-hud-points">0</b> map pts</span>
+          <span class="hud-stat"><i class="dot" id="view-ws-dot"></i><span id="view-ws-text">WS</span></span>
+          <span class="hud-stat"><i class="dot" id="view-lidar-dot"></i>LIDAR</span>
+          <span class="hud-stat"><i class="dot" id="view-slam-dot"></i>SLAM</span>
+        </div>
+        <div class="hud hud-bottom-left" id="color-legend">
+          <span class="legend-title" id="legend-title">HEIGHT</span>
+          <span class="legend-bar"></span>
+          <span class="legend-range"><b id="legend-min">-2.0 m</b><b id="legend-max">+6.0 m</b></span>
+        </div>
+        <div class="hud hud-bottom-right free-hint" id="free-hint">
+          Drag rotate · Wheel zoom · Right-drag pan
+        </div>
+        <div class="canvas-overlay" id="canvas-overlay">
+          <div class="spinner"></div>
+          <p id="overlay-text">Waiting for the first LiDAR frame…</p>
+          <small id="overlay-hint">Check the ROS bridge and <code>/livox/lidar</code>.</small>
+        </div>
+      </div>
+    </section>
+
+    <!-- ===================== DEM ===================== -->
+    <section class="tab-panel" id="tab-dem">
+      <div class="dem-toolbar">
+        <div class="dem-stats">
+          <span class="dem-chip"><b id="dem-status">IDLE</b> status</span>
+          <span class="dem-chip"><b id="dem-resolution">—</b> resolution</span>
+          <span class="dem-chip"><b id="dem-min">—</b> min elev</span>
+          <span class="dem-chip"><b id="dem-max">—</b> max elev</span>
+          <span class="dem-chip"><b id="dem-ground">0</b> ground pts</span>
+          <span class="dem-chip"><b id="dem-tiles">0</b> tiles</span>
+          <span class="dem-chip coord"><b id="dem-mode">LOCALIZED</b> coordinates</span>
+        </div>
+        <div class="dem-actions">
+          <a class="tool-btn" href="/api/dem/export.tif">GeoTIFF</a>
+          <a class="tool-btn" href="/api/dem/export/ground.pcd">Ground PCD</a>
+          <a class="tool-btn" href="/api/dem/export.json">Metadata</a>
+        </div>
+      </div>
+
+      <div class="canvas-wrap dem-canvas-wrap">
+        <canvas id="dem-canvas"></canvas>
+        <div class="hud hud-top-left">
+          <span class="view-readout">DEM · LOCALIZED</span>
+          <span class="hud-sub" id="dem-sub">incremental terrain from FAST-LIO2 global points</span>
+        </div>
+        <div class="hud hud-top-right">
+          <span class="hud-stat"><b id="dem-hud-ground">0</b> ground</span>
+          <span class="hud-stat"><b id="dem-hud-tiles">0</b> tiles</span>
+          <span class="hud-stat"><b id="dem-hud-res">—</b> res</span>
+          <span class="hud-stat"><i class="dot" id="dem-dot"></i><span id="dem-hud-status">DEM</span></span>
+        </div>
+        <div class="hud hud-bottom-left" id="dem-legend">
+          <span class="legend-title">ELEVATION (LOCAL Z, m)</span>
+          <span class="legend-bar"></span>
+          <span class="legend-range"><b id="dem-legend-min">—</b><b id="dem-legend-max">—</b></span>
+        </div>
+        <div class="hud hud-bottom-right">
+          Drag rotate · Wheel zoom · Right-drag pan
+        </div>
+        <div class="canvas-overlay" id="dem-overlay">
+          <div class="spinner"></div>
+          <p id="dem-overlay-text">Waiting for the DEM service…</p>
+          <small id="dem-overlay-hint">Start <code>scripts/start_dem.sh</code> after FAST-LIO2 is mapping.</small>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <script src="/static/vendor/three.min.js"></script>
+  <script src="/static/vendor/OrbitControls.js"></script>
+  <script src="/static/js/viewer.js"></script>
+  <script src="/static/js/dem_view.js"></script>
+  <script src="/static/js/app.js"></script>
+</body>
+</html>u�jGO      k4k5�J-��k4   D    O^partitionKey=%28http%2C127.0.0.1%2C5000%29,:http://127.0.0.1:5000/ strongly-framed 1 request-method GET response-head HTTP/1.0 200 OK
+Content-Type: text/html; charset=utf-8
+Content-Length: 15086
+Server: Werkzeug/2.0.3 Python/3.6.9
+Date: Mon, 23 Nov 2026 12:39:36 GMT
+ original-response-headers Content-Type: text/html; charset=utf-8
+Content-Length: 15086
+Server: Werkzeug/2.0.3 Python/3.6.9
+Date: Mon, 23 Nov 2026 12:39:36 GMT
+ ctid 1 uncompressed-len 0 net-response-time-onstart 114 net-response-time-onstop 134   :�

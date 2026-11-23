@@ -1,0 +1,2 @@
+FAST_LIO:lidar_slam_bridge:livox_ros_driver
+-DCATKIN_DEVEL_PREFIX=/home/rajesh/rviz_web_app/slam_ws/devel -DCMAKE_INSTALL_PREFIX=/home/rajesh/rviz_web_app/slam_ws/install -G Unix Makefiles

@@ -1,0 +1,6 @@
+archive.mozilla.org:HSTS	0	20780	1826973471227,1,0
+getpocket.cdn.mozilla.net:HSTS	0	20780	1826973452477,1,0
+aus5.mozilla.org:HSTS	0	20780	1826973469210,1,0
+shavar.services.mozilla.com^firstPartyDomain=safebrowsing.86868755-6b82-4842-b301-72671a0db32e.mozilla:HSTS	0	20780	1826973458336,1,1
+location.services.mozilla.com:HSTS	0	20780	1826973447059,1,0
+firefox.settings.services.mozilla.com:HSTS	0	20780	1826973459224,1,0

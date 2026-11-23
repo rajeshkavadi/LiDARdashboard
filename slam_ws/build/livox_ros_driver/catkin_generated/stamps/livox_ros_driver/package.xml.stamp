@@ -1,0 +1,18 @@
+<?xml version="1.0"?>
+<package format="2">
+  <name>livox_ros_driver</name>
+  <version>1.0.0</version>
+  <description>
+    Message-only compatibility package for FAST-LIO2.  It provides the
+    livox_ros_driver/CustomMsg type that FAST_LIO compiles against.  It is NOT
+    the Livox driver and does not start or replace the existing driver.
+  </description>
+  <maintainer email="rajesh@example.com">rajesh</maintainer>
+  <license>BSD</license>
+
+  <buildtool_depend>catkin</buildtool_depend>
+  <build_depend>message_generation</build_depend>
+  <build_depend>std_msgs</build_depend>
+  <exec_depend>message_runtime</exec_depend>
+  <exec_depend>std_msgs</exec_depend>
+</package>

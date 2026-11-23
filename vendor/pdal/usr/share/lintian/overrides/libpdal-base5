@@ -1,0 +1,3 @@
+# False positive, part of NormalX, NormalY, NormalZ
+libpdal-base5: spelling-error-in-binary usr/lib/libpdal_base.so.* NormalY Normally
+

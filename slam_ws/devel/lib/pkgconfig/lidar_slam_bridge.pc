@@ -1,0 +1,8 @@
+prefix=/home/rajesh/rviz_web_app/slam_ws/devel
+
+Name: lidar_slam_bridge
+Description: Description of lidar_slam_bridge
+Version: 1.0.0
+Cflags: 
+Libs: -L${prefix}/lib 
+Requires: 

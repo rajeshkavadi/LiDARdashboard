@@ -1,0 +1,46 @@
+<launch>
+  <!--
+    Starts FAST-LIO2 and its web exporter.  It deliberately does NOT start the
+    Livox driver, roscore, RViz or the existing lidar_web_bridge: all of those
+    keep running exactly as before and share the same sensor topics.
+  -->
+
+  <arg name="map_port" default="8766" />
+  <arg name="tile_size" default="20.0" />
+  <arg name="voxel_size" default="0.15" />
+  <arg name="max_voxels" default="2000000" />
+  <arg name="input_topic" default="/livox/lidar" />
+  <arg name="custom_topic" default="/livox/lidar_custom" />
+
+  <!-- PointCloud2 -> Livox CustomMsg, preserving real point timestamps. -->
+  <node pkg="lidar_slam_bridge" type="livox_pc2_to_custom.py"
+        name="livox_pc2_to_custom" output="screen">
+    <param name="input_topic" value="$(arg input_topic)" />
+    <param name="output_topic" value="$(arg custom_topic)" />
+  </node>
+
+  <!-- FAST-LIO2 (upstream hku-mars FAST_LIO package name: fast_lio). -->
+  <rosparam command="load"
+            file="$(find lidar_slam_bridge)/config/mid360_web.yaml" />
+  <param name="feature_extract_enable" type="bool" value="0" />
+  <param name="point_filter_num" type="int" value="3" />
+  <param name="max_iteration" type="int" value="3" />
+  <param name="filter_size_surf" type="double" value="0.3" />
+  <param name="filter_size_map" type="double" value="0.3" />
+  <param name="cube_side_length" type="double" value="1000" />
+  <param name="runtime_pos_log_enable" type="bool" value="0" />
+  <node pkg="fast_lio" type="fastlio_mapping" name="laserMapping"
+        output="screen" required="true" />
+
+  <!-- Incremental global map / pose / trajectory to the web backend. -->
+  <node pkg="lidar_slam_bridge" type="slam_web_bridge.py"
+        name="slam_web_bridge" output="screen">
+    <param name="odom_topic" value="/Odometry" />
+    <param name="cloud_topic" value="/cloud_registered" />
+    <param name="server_host" value="127.0.0.1" />
+    <param name="server_port" value="$(arg map_port)" />
+    <param name="tile_size" value="$(arg tile_size)" />
+    <param name="voxel_size" value="$(arg voxel_size)" />
+    <param name="max_voxels" value="$(arg max_voxels)" />
+  </node>
+</launch>

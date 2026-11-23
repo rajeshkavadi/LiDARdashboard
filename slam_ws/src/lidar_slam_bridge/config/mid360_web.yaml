@@ -1,0 +1,42 @@
+# FAST-LIO2 configuration for the Livox Mid-360 used by this project.
+#
+# The input topic is the CustomMsg produced by livox_pc2_to_custom.py.  That
+# node uses the real per-point `timestamp` field in the existing PointCloud2
+# stream (absolute Unix ns); it refuses to run without it.
+common:
+  lid_topic: "/livox/lidar_custom"
+  imu_topic: "/livox/imu"
+  time_sync_en: false
+  time_offset_lidar_to_imu: 0.0
+
+preprocess:
+  lidar_type: 1          # Livox (CustomMsg path in FAST-LIO2)
+  scan_line: 4           # Mid-360 has four laser lines
+  blind: 0.5             # metres
+  point_filter_num: 3
+
+mapping:
+  acc_cov: 0.1
+  gyr_cov: 0.1
+  b_acc_cov: 0.0001
+  b_gyr_cov: 0.0001
+  fov_degree: 360
+  det_range: 100.0
+  extrinsic_est_en: false
+  # FAST-LIO2's `extrinsic_T` is the LiDAR position in the IMU frame.
+  # Livox Mid-360 manual: IMU position in LiDAR coordinates is
+  # (+11.0, +23.29, -44.12) mm, hence the negated values below.
+  extrinsic_T: [-0.011, -0.02329, 0.04412]
+  extrinsic_R: [1, 0, 0,
+                0, 1, 0,
+                0, 0, 1]
+
+publish:
+  path_en: true
+  scan_publish_en: true
+  dense_publish_en: true
+  scan_bodyframe_pub_en: false
+
+pcd_save:
+  pcd_save_en: false
+  interval: -1

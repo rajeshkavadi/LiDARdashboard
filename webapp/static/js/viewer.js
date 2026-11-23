@@ -1,26 +1,36 @@
-/* Live LiDAR point-cloud viewer (Three.js r128).
+/* LiDAR viewer (Three.js r128): LIVE and GLOBAL MAP.
  *
- * One point cloud, one geometry, one GPU buffer set.  Only the camera changes
- * between FRONT / BACK / LEFT / RIGHT / FREE, so switching views never touches
- * the stream or the ROS side.
+ * LIVE mode keeps the original behaviour: one point cloud, one geometry, one
+ * GPU buffer set, camera presets relative to the sensor origin.
  *
- * Frame layout must match webapp/frame_hub.py:
+ * GLOBAL MAP mode draws the FAST-LIO2 map as independent spatial tiles.  The
+ * backend sends only new points per tile, so buffers grow incrementally; GPU
+ * memory is bounded by a configurable rendered-point budget.  A trajectory
+ * line and a pose marker live in the same global frame.
+ *
+ * Live frame layout must match webapp/frame_hub.py:
  *   4s magic "LVP1" | u32 count | f64 stamp | u32 seq | u16 frameIdLen |
  *   2 pad | frameId (padded to 4) | count * (f32 x, y, z, intensity)
+ *
+ * Global-map / DEM message layouts are documented in webapp/protocol.py.
  */
 (function (global) {
   'use strict';
 
-  var MAGIC = 0x3150564c; // "LVP1" little endian
+  var MAGIC = 0x3150564c;       // "LVP1"
+  var MAP_MAGIC = 0x314d564c;   // "LVM1"
   var HEADER_SIZE = 24;
   var POINT_BYTES = 16;
   var DEFAULT_CAPACITY = 300000;
-  var RING_STEP = 5;        // metres between range rings
-  var RING_COUNT = 8;       // 5 m … 40 m
-  var BASE_FOV = 72;        // FRONT/BACK/LEFT/RIGHT field of view at zoom 1
-  var TOP_HALF = 6;         // TOP ortho half-height: the 5 m ring fits the frame
-  var ZOOM_MIN = 0.15;      // 6 / 0.15 = 40 m half-height: the whole ring set
-  var ZOOM_MAX = 8;         // 6 / 8 = 0.75 m half-height at the tightest zoom
+  var RING_STEP = 5;
+  var RING_COUNT = 8;
+  var BASE_FOV = 72;
+  var TOP_HALF = 6;
+  var ZOOM_MIN_LIVE = 0.15;
+  var ZOOM_MIN_MAP = 0.004;
+  var ZOOM_MAX = 8;
+  var MAP_MAX_TILES = 1600;
+  var TRAJ_CAPACITY = 200000;
 
   var COLOR_STOPS = [
     [0.00, 0.15, 0.29, 0.86],
@@ -42,8 +52,10 @@
     this.canvas = canvas;
     this.onStats = options.onStats || function () {};
     this.mode = 'front';
+    this.displayMode = 'live';
     this.colorMode = 'height';
     this.maxPoints = 120000;
+    this.mapMaxPoints = 1000000;
     this.active = true;
     this.capacity = DEFAULT_CAPACITY;
     this.drawn = 0;
@@ -59,9 +71,26 @@
     this._frameSeq = 0;
     this._frameCount = 0;
     this.zoom = 1;
+    this._zoomMin = ZOOM_MIN_LIVE;
+
+    // Global map state
+    this.mapTiles = {};
+    this.mapDirty = {};
+    this._mapDirtyAll = false;
+    this.mapPointCount = 0;
+    this.mapTruncated = false;
+    this.mapZMin = Infinity;
+    this.mapZMax = -Infinity;
+    this.bounds = { minX: Infinity, maxX: -Infinity,
+                    minY: Infinity, maxY: -Infinity };
+    this._mapStride = 1;
+    this._lastRecolor = 0;
+    this.pose = null;
+    this.trajectoryCount = 0;
 
     this._initScene();
     this._initBuffers(this.capacity);
+    this._initMapScene();
     this._bind();
     this.setView('front');
     this._loop();
@@ -83,22 +112,19 @@
 
     this.scene = new THREE.Scene();
 
-    this.camera = new THREE.PerspectiveCamera(BASE_FOV, width / height, 0.05, 900);
-    this.camera.up.set(0, 0, 1); // ROS convention: X fwd, Y left, Z up
+    this.camera = new THREE.PerspectiveCamera(BASE_FOV, width / height, 0.05, 2500);
+    this.camera.up.set(0, 0, 1);
     this.viewCamera = this.camera;
 
-    // Orthographic overhead camera for the TOP map: true top-down, so the
-    // 5 m range rings stay circular and evenly spaced.
     var half = TOP_HALF;
     this.topCamera = new THREE.OrthographicCamera(
-      -half * (width / height), half * (width / height), half, -half, 0.1, 400
+      -half * (width / height), half * (width / height), half, -half, 0.1, 2500
     );
-    this.topCamera.up.set(1, 0, 0); // +X up the screen
+    this.topCamera.up.set(1, 0, 0);
     this.topCamera.position.set(0, 0, 120);
     this.topCamera.lookAt(0, 0, 0);
     this.topCamera.updateMatrixWorld();
 
-    // Ground / reference grid on the XY plane (Z up).
     var grid = new THREE.GridHelper(120, 60, 0x274055, 0x14202e);
     grid.rotation.x = Math.PI / 2;
     grid.material.transparent = true;
@@ -106,13 +132,11 @@
     grid.material.depthWrite = false;
     this.scene.add(grid);
 
-    // ROS-aligned axes: X red (forward), Y green (left), Z blue (up).
     this.axes = new THREE.AxesHelper(2.2);
     this.axes.material.depthTest = false;
     this.axes.renderOrder = 5;
     this.scene.add(this.axes);
 
-    // Sensor origin indicator.
     var origin = new THREE.Mesh(
       new THREE.SphereGeometry(0.1, 16, 12),
       new THREE.MeshBasicMaterial({ color: 0xffc451 })
@@ -139,13 +163,12 @@
     this.controls.dampingFactor = 0.08;
     this.controls.screenSpacePanning = true;
     this.controls.minDistance = 0.3;
-    this.controls.maxDistance = 400;
+    this.controls.maxDistance = 2000;
     this.controls.enabled = false;
 
     this._initRangeRings();
   };
 
-  /** 5 m concentric distance rings on the ground plane, TOP view only. */
   PointCloudViewer.prototype._initRangeRings = function () {
     var group = new THREE.Group();
     group.visible = false;
@@ -200,7 +223,7 @@
       depthTest: false,
       depthWrite: false
     }));
-    var angle = Math.PI / 4; // 45° between +X and +Y, clear of the axes
+    var angle = Math.PI / 4;
     sprite.position.set(Math.cos(angle) * radius, Math.sin(angle) * radius, 0.05);
     sprite.scale.set(1.7, 0.85, 1);
     sprite.renderOrder = 4;
@@ -241,6 +264,60 @@
     this.scene.add(this.points);
   };
 
+  /* ------------------------- global map scene ------------------------- */
+
+  PointCloudViewer.prototype._initMapScene = function () {
+    this.mapGroup = new THREE.Group();
+    this.mapGroup.visible = false;
+    this.scene.add(this.mapGroup);
+
+    this.mapMaterial = new THREE.PointsMaterial({
+      size: 0.11,
+      sizeAttenuation: true,
+      vertexColors: true,
+      transparent: false,
+      depthWrite: true
+    });
+
+    // Reusable trajectory geometry with a fixed capacity; only the draw range
+    // grows, so appending never reallocates GPU buffers.
+    this.trajPositions = new Float32Array(TRAJ_CAPACITY * 3);
+    var trajGeom = new THREE.BufferGeometry();
+    this.trajAttr = new THREE.BufferAttribute(this.trajPositions, 3);
+    this.trajAttr.setUsage(THREE.DynamicDrawUsage);
+    trajGeom.setAttribute('position', this.trajAttr);
+    trajGeom.setDrawRange(0, 0);
+    this.trajectoryLine = new THREE.Line(
+      trajGeom,
+      new THREE.LineBasicMaterial({ color: 0xffc451, linewidth: 1 })
+    );
+    this.trajectoryLine.frustumCulled = false;
+    this.trajectoryLine.renderOrder = 4;
+    this.scene.add(this.trajectoryLine);
+
+    this.sensorGroup = new THREE.Group();
+    this.sensorGroup.visible = false;
+    var marker = new THREE.Mesh(
+      new THREE.SphereGeometry(0.22, 16, 12),
+      new THREE.MeshBasicMaterial({ color: 0x35e0c0, depthTest: false })
+    );
+    marker.renderOrder = 8;
+    this.sensorGroup.add(marker);
+    var sAxes = new THREE.AxesHelper(2.4);
+    sAxes.material.depthTest = false;
+    sAxes.renderOrder = 7;
+    this.sensorGroup.add(sAxes);
+    var fov = new THREE.Mesh(
+      new THREE.RingGeometry(1.2, 1.28, 48, 1, -Math.PI / 4, Math.PI / 2),
+      new THREE.MeshBasicMaterial({
+        color: 0x35e0c0, side: THREE.DoubleSide,
+        transparent: true, opacity: 0.55, depthTest: false
+      })
+    );
+    this.sensorGroup.add(fov);
+    this.scene.add(this.sensorGroup);
+  };
+
   PointCloudViewer.prototype._bind = function () {
     var self = this;
     this._onResize = function () { self.resize(); };
@@ -253,7 +330,6 @@
     this.canvas.addEventListener('wheel', this._onWheel, { passive: false });
   };
 
-  /** Wheel zoom for the fixed views; FREE VIEW keeps OrbitControls' dolly. */
   PointCloudViewer.prototype._wheel = function (ev) {
     if (!this.active || this.mode === 'free') return;
     ev.preventDefault();
@@ -262,11 +338,10 @@
   };
 
   PointCloudViewer.prototype._setZoom = function (zoom) {
-    this.zoom = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, zoom));
+    this.zoom = Math.min(ZOOM_MAX, Math.max(this._zoomMin, zoom));
     if (this.mode === 'top') {
       this.topCamera.zoom = this.zoom;
       this.topCamera.updateProjectionMatrix();
-      // Keep ring labels the same size on screen at every zoom level.
       var labels = this.ringLabels || [];
       for (var i = 0; i < labels.length; i++) {
         labels[i].scale.set(1.7 / this.zoom, 0.85 / this.zoom, 1);
@@ -306,49 +381,79 @@
 
   /* --------------------------- camera presets --------------------------- */
 
+  PointCloudViewer.prototype.setDisplayMode = function (mode) {
+    this.displayMode = mode === 'global' ? 'global' : 'live';
+    var global = this.displayMode === 'global';
+    this.points.visible = !global;
+    this.mapGroup.visible = global;
+    this.sensorGroup.visible = global;
+    this.ranges.visible = !global && this.mode === 'top';
+    this._zoomMin = global ? ZOOM_MIN_MAP : ZOOM_MIN_LIVE;
+    this.setView(this.mode);
+  };
+
   PointCloudViewer.prototype.setView = function (mode) {
     this.mode = mode;
-    this.ranges.visible = mode === 'top';
+    this.ranges.visible = this.mode === 'top' && this.displayMode === 'live';
     this.camera.up.set(0, 0, 1);
-    this._setZoom(1); // each view starts at its default framing
+    this._setZoom(1);
 
     if (mode === 'top') {
-      // Overhead map: +X up the screen, +Y to the left, distance rings on Z=0.
       this.controls.enabled = false;
       this.viewCamera = this.topCamera;
+      if (this.displayMode === 'global' && this.pose) {
+        this._fitTopToMap();
+      }
+      this._applyPoseCamera();
       return;
     }
     this.viewCamera = this.camera;
 
     if (mode === 'free') {
-      // Keep the current orientation but pull back so orbiting works.
       var dir = new THREE.Vector3();
       this.camera.getWorldDirection(dir);
-      this.camera.position.copy(dir).multiplyScalar(-24);
-      this.controls.target.set(0, 0, 0);
+      var distance = 24;
+      if (this.displayMode === 'global') {
+        var centre = this._mapCentre();
+        var radius = this._mapRadius();
+        distance = Math.max(24, radius * 2.2);
+        this.controls.target.copy(centre);
+        this.camera.position.copy(centre).addScaledVector(dir, -distance);
+      } else {
+        this.camera.position.copy(dir).multiplyScalar(-distance);
+        this.controls.target.set(0, 0, 0);
+      }
+      this.camera.up.set(0, 0, 1);
       this.controls.enabled = true;
       this.controls.update();
+      this.camera.updateMatrixWorld();
       return;
     }
 
-    var preset = VIEWS[mode] || VIEWS.front;
     this.controls.enabled = false;
-    // Camera stays exactly at the LiDAR origin; only the orientation changes.
     this.camera.position.set(0, 0, 0);
+    var preset = VIEWS[mode] || VIEWS.front;
     this.camera.lookAt(preset.dir[0] * 10, preset.dir[1] * 10, preset.dir[2] * 10);
     this.camera.updateMatrixWorld();
+    this._applyPoseCamera();
   };
 
   PointCloudViewer.prototype.setColorMode = function (mode) {
     this.colorMode = mode;
     this._rangeReady = false;
+    this._recolorMap();
   };
 
   PointCloudViewer.prototype.setMaxPoints = function (limit) {
     this.maxPoints = limit;
   };
 
-  /* ------------------------------ data path ----------------------------- */
+  PointCloudViewer.prototype.setMapMaxPoints = function (limit) {
+    this.mapMaxPoints = limit;
+    this._recolorMap();
+  };
+
+  /* ------------------------------ live data ----------------------------- */
 
   PointCloudViewer.prototype.applyFrame = function (buffer) {
     if (!buffer || buffer.byteLength < HEADER_SIZE) return false;
@@ -421,11 +526,10 @@
     return true;
   };
 
-  /** Slowly adapt the colour ranges (height and range) without flicker. */
   PointCloudViewer.prototype._updateRange = function (src, total, stride) {
     var lo = Infinity;
     var hi = -Infinity;
-    var hist = new Uint32Array(101); // 1 m bins up to 100 m
+    var hist = new Uint32Array(101);
     var valid = 0;
     for (var s = 0; s < total; s += stride) {
       var x = src[s * 4];
@@ -443,8 +547,6 @@
     }
     if (!isFinite(lo) || !isFinite(hi)) return;
 
-    // 99th percentile range: a few stray long returns must not wash out the
-    // colour ramp for the rest of the scene.
     var far = 0;
     if (valid) {
       var target = valid * 0.99;
@@ -483,6 +585,387 @@
     out[i + 2] = a[3] + (b[3] - a[3]) * f;
   };
 
+  /* ----------------------------- global data ---------------------------- */
+
+  PointCloudViewer.prototype.applyMapMessage = function (buffer) {
+    if (!buffer || buffer.byteLength < 8) return false;
+    var view = new DataView(buffer);
+    if (view.getUint32(0, true) !== MAP_MAGIC) return false;
+    var type = view.getUint8(4);
+    if (type === 4) { this.resetMapView(); return true; }
+    if (type === 1) return this._applyTile(view, buffer);
+    if (type === 2) return this._applyTrajectory(view, buffer);
+    if (type === 3) return this._applyPose(view);
+    return false;
+  };
+
+  PointCloudViewer.prototype._applyTile = function (view, buffer) {
+    var tx = view.getInt32(8, true);
+    var ty = view.getInt32(12, true);
+    var tz = view.getInt32(16, true);
+    var count = view.getUint32(20, true);
+    var offset = 24;
+    if (!count || offset + count * POINT_BYTES > buffer.byteLength) return false;
+    var src = new Float32Array(buffer, offset, count * 4);
+
+    var key = tx + ',' + ty + ',' + tz;
+    var tile = this.mapTiles[key];
+    if (!tile) {
+      if (Object.keys(this.mapTiles).length >= MAP_MAX_TILES) {
+        this.mapTruncated = true;
+        return false;
+      }
+      tile = {
+        key: key, tx: tx, ty: ty, tz: tz,
+        positions: new Float32Array(Math.max(1024, count) * 3),
+        intensities: new Float32Array(Math.max(1024, count)),
+        count: 0,
+        renderedCount: 0,
+        stride: this._mapStrideFor(),
+        pointsMesh: null
+      };
+      this.mapTiles[key] = tile;
+    }
+    if (tile.count + count > tile.intensities.length) {
+      var capacity = tile.intensities.length;
+      while (capacity < tile.count + count) capacity *= 2;
+      var positions = new Float32Array(capacity * 3);
+      var intensities = new Float32Array(capacity);
+      positions.set(tile.positions.subarray(0, tile.count * 3));
+      intensities.set(tile.intensities.subarray(0, tile.count));
+      tile.positions = positions;
+      tile.intensities = intensities;
+    }
+
+    for (var i = 0; i < count; i++) {
+      var si = i * 4;
+      var di = (tile.count + i) * 3;
+      var x = src[si], y = src[si + 1], z = src[si + 2];
+      tile.positions[di] = x;
+      tile.positions[di + 1] = y;
+      tile.positions[di + 2] = z;
+      tile.intensities[tile.count + i] = src[si + 3];
+      if (z < this.mapZMin) this.mapZMin = z;
+      if (z > this.mapZMax) this.mapZMax = z;
+      if (x < this.bounds.minX) this.bounds.minX = x;
+      if (x > this.bounds.maxX) this.bounds.maxX = x;
+      if (y < this.bounds.minY) this.bounds.minY = y;
+      if (y > this.bounds.maxY) this.bounds.maxY = y;
+    }
+    var oldCount = tile.count;
+    tile.count += count;
+    this.mapPointCount += count;
+    this._appendTilePoints(tile, oldCount, count);
+    this._maybeRecolor();
+    return true;
+  };
+
+  PointCloudViewer.prototype._mapStrideFor = function () {
+    if (!this.mapMaxPoints || this.mapMaxPoints <= 0) return 1;
+    return Math.max(1, Math.ceil(this.mapPointCount / this.mapMaxPoints));
+  };
+
+  PointCloudViewer.prototype._ensureTileGeometry = function (tile, needed) {
+    if (tile.pointsMesh && tile.geometryCapacity >= needed) return false;
+    var capacity = tile.geometryCapacity || 1024;
+    while (capacity < needed) capacity *= 2;
+    var positions = new Float32Array(capacity * 3);
+    var colors = new Float32Array(capacity * 3);
+    if (tile.positionsOut) {
+      positions.set(tile.positionsOut.subarray(0, tile.renderedCount * 3));
+      colors.set(tile.colorsOut.subarray(0, tile.renderedCount * 3));
+    }
+    var geometry = new THREE.BufferGeometry();
+    var positionAttr = new THREE.BufferAttribute(positions, 3);
+    var colorAttr = new THREE.BufferAttribute(colors, 3);
+    positionAttr.setUsage(THREE.DynamicDrawUsage);
+    colorAttr.setUsage(THREE.DynamicDrawUsage);
+    geometry.setAttribute('position', positionAttr);
+    geometry.setAttribute('color', colorAttr);
+    if (tile.pointsMesh) {
+      this.mapGroup.remove(tile.pointsMesh);
+      tile.pointsMesh.geometry.dispose();
+    }
+    tile.pointsMesh = new THREE.Points(geometry, this.mapMaterial);
+    tile.pointsMesh.frustumCulled = false;
+    this.mapGroup.add(tile.pointsMesh);
+    tile.geometryCapacity = capacity;
+    tile.positionsOut = positions;
+    tile.colorsOut = colors;
+    tile.positionAttr = positionAttr;
+    tile.colorAttr = colorAttr;
+    return true;
+  };
+
+  PointCloudViewer.prototype._pointColor = function (tile, index, out, oi, invSpan, radius) {
+    var si = index * 3;
+    var x = tile.positions[si];
+    var y = tile.positions[si + 1];
+    var z = tile.positions[si + 2];
+    var t;
+    if (this.colorMode === 'height') {
+      t = (z - this.mapZMin) * invSpan;
+    } else if (this.colorMode === 'distance') {
+      t = Math.sqrt(x * x + y * y + z * z) / radius;
+    } else {
+      t = tile.intensities[index] / 255;
+    }
+    if (t < 0) t = 0; else if (t > 1) t = 1;
+    this._ramp(t, out, oi);
+  };
+
+  /** Append only the new voxel points to this tile's GPU buffers. */
+  PointCloudViewer.prototype._appendTilePoints = function (tile, rawStart, count) {
+    var stride = this._mapStrideFor();
+    if (tile.stride !== stride) {
+      // Decimation changed: rebuild the whole tile from raw data lazily.
+      tile.stride = stride;
+      this.mapDirty[tile.key] = true;
+      return;
+    }
+    if (this.mapDirty[tile.key]) return; // a full refresh will include these
+
+    var renderedAdd = 0;
+    for (var j = 0; j < count; j++) {
+      if ((rawStart + j) % stride === 0) renderedAdd += 1;
+    }
+    if (!renderedAdd) return;
+    var needed = tile.renderedCount + renderedAdd;
+    var reallocated = this._ensureTileGeometry(tile, needed);
+
+    var span = this.mapZMax - this.mapZMin;
+    if (!(span > 0.001)) span = 0.001;
+    var invSpan = 1 / span;
+    var radius = Math.max(this._mapRadius(), 1);
+    var startRendered = tile.renderedCount;
+    for (var k = 0; k < count; k++) {
+      var index = rawStart + k;
+      if (index % stride !== 0) continue;
+      var di = tile.renderedCount * 3;
+      var si = index * 3;
+      tile.positionsOut[di] = tile.positions[si];
+      tile.positionsOut[di + 1] = tile.positions[si + 1];
+      tile.positionsOut[di + 2] = tile.positions[si + 2];
+      this._pointColor(tile, index, tile.colorsOut, di, invSpan, radius);
+      tile.renderedCount += 1;
+    }
+
+    var uploadOffset = reallocated ? 0 : startRendered * 3;
+    var uploadCount = reallocated ? tile.renderedCount * 3 : renderedAdd * 3;
+    tile.positionAttr.updateRange.offset = uploadOffset;
+    tile.positionAttr.updateRange.count = uploadCount;
+    tile.positionAttr.needsUpdate = true;
+    tile.colorAttr.updateRange.offset = uploadOffset;
+    tile.colorAttr.updateRange.count = uploadCount;
+    tile.colorAttr.needsUpdate = true;
+    tile.pointsMesh.geometry.setDrawRange(0, tile.renderedCount);
+  };
+
+  /** Full tile rebuild used when decimation or the colour ramp changes. */
+  PointCloudViewer.prototype._refreshTile = function (tile) {
+    var stride = this._mapStrideFor();
+    var count = Math.ceil(tile.count / stride);
+    if (count <= 0) return;
+    this._ensureTileGeometry(tile, count);
+    var span = this.mapZMax - this.mapZMin;
+    if (!(span > 0.001)) span = 0.001;
+    var invSpan = 1 / span;
+    var radius = Math.max(this._mapRadius(), 1);
+
+    for (var i = 0, s = 0; i < count; i++, s += stride) {
+      var di = i * 3;
+      var si = s * 3;
+      tile.positionsOut[di] = tile.positions[si];
+      tile.positionsOut[di + 1] = tile.positions[si + 1];
+      tile.positionsOut[di + 2] = tile.positions[si + 2];
+      this._pointColor(tile, s, tile.colorsOut, di, invSpan, radius);
+    }
+    tile.renderedCount = count;
+    tile.stride = stride;
+    tile.positionAttr.updateRange.offset = 0;
+    tile.positionAttr.updateRange.count = count * 3;
+    tile.positionAttr.needsUpdate = true;
+    tile.colorAttr.updateRange.offset = 0;
+    tile.colorAttr.updateRange.count = count * 3;
+    tile.colorAttr.needsUpdate = true;
+    tile.pointsMesh.geometry.setDrawRange(0, count);
+  };
+
+  PointCloudViewer.prototype._processMapDirty = function (limit) {
+    if (this._mapDirtyAll) {
+      this._mapDirtyAll = false;
+      for (var key in this.mapTiles) {
+        if (this.mapTiles.hasOwnProperty(key)) this.mapDirty[key] = true;
+      }
+    }
+    var keys = Object.keys(this.mapDirty);
+    for (var i = 0; i < keys.length && i < limit; i++) {
+      var tileKey = keys[i];
+      if (this.mapTiles[tileKey]) this._refreshTile(this.mapTiles[tileKey]);
+      delete this.mapDirty[tileKey];
+    }
+  };
+
+  PointCloudViewer.prototype._maybeRecolor = function () {
+    var stride = this._mapStrideFor();
+    if (stride !== this._mapStride) {
+      this._mapStride = stride;
+      this._recolorMap();
+      return;
+    }
+    // Recolour all tiles when the height range drifts enough to make the
+    // colour ramp misleading, at most once every two seconds.
+    var now = performance.now();
+    var span = this.mapZMax - this.mapZMin;
+    var reference = this._colorRefSpan || 0;
+    if (!reference) {
+      this._colorRefSpan = span;
+      this._colorRefMin = this.mapZMin;
+      return;
+    }
+    if (Math.abs(span - reference) > Math.max(2, reference * 0.2) &&
+        now - this._lastRecolor > 2000) {
+      this._colorRefSpan = span;
+      this._colorRefMin = this.mapZMin;
+      this._lastRecolor = now;
+      this._recolorMap();
+    }
+  };
+
+  PointCloudViewer.prototype._recolorMap = function () {
+    this._mapDirtyAll = true;
+    this._processMapDirty(2000);
+  };
+
+  PointCloudViewer.prototype._applyTrajectory = function (view, buffer) {
+    var start = view.getUint32(8, true);
+    var count = view.getUint32(12, true);
+    var offset = 16;
+    if (start + count > TRAJ_CAPACITY) return false;
+    if (offset + count * 24 > buffer.byteLength) return false;
+    var src = new DataView(buffer, offset, count * 24);
+    for (var i = 0; i < count; i++) {
+      var di = (start + i) * 3;
+      this.trajPositions[di] = src.getFloat64(i * 24, true);
+      this.trajPositions[di + 1] = src.getFloat64(i * 24 + 8, true);
+      this.trajPositions[di + 2] = src.getFloat64(i * 24 + 16, true);
+    }
+    this.trajectoryCount = Math.min(TRAJ_CAPACITY, Math.max(this.trajectoryCount, start + count));
+    this.trajAttr.updateRange.offset = 0;
+    this.trajAttr.updateRange.count = this.trajectoryCount * 3;
+    this.trajAttr.needsUpdate = true;
+    this.trajectoryLine.geometry.setDrawRange(0, this.trajectoryCount);
+    return true;
+  };
+
+  PointCloudViewer.prototype._applyPose = function (view) {
+    var values = [];
+    for (var i = 0; i < 8; i++) values.push(view.getFloat64(8 + i * 8, true));
+    this.pose = {
+      stamp: values[0],
+      x: values[1], y: values[2], z: values[3],
+      qx: values[4], qy: values[5], qz: values[6], qw: values[7]
+    };
+    this.sensorGroup.position.set(this.pose.x, this.pose.y, this.pose.z);
+    this.sensorGroup.quaternion.set(
+      this.pose.qx, this.pose.qy, this.pose.qz, this.pose.qw);
+    this.sensorGroup.visible = this.displayMode === 'global';
+    this._applyPoseCamera();
+    return true;
+  };
+
+  PointCloudViewer.prototype._applyPoseCamera = function () {
+    if (this.displayMode !== 'global' || !this.pose || this.mode === 'free') return;
+    var pose = this.pose;
+    var position = new THREE.Vector3(pose.x, pose.y, pose.z);
+    var quaternion = new THREE.Quaternion(pose.qx, pose.qy, pose.qz, pose.qw);
+    var up = new THREE.Vector3(0, 0, 1).applyQuaternion(quaternion);
+
+    if (this.mode === 'top') {
+      var forward = new THREE.Vector3(1, 0, 0).applyQuaternion(quaternion);
+      forward.z = 0;
+      if (forward.lengthSq() < 1e-6) forward.set(1, 0, 0);
+      forward.normalize();
+      this.topCamera.up.copy(forward);
+      this.topCamera.position.set(pose.x, pose.y, pose.z + 900);
+      this.topCamera.lookAt(pose.x, pose.y, pose.z);
+      this.topCamera.updateMatrixWorld();
+      return;
+    }
+
+    var preset = VIEWS[this.mode] || VIEWS.front;
+    var direction = new THREE.Vector3(
+      preset.dir[0], preset.dir[1], preset.dir[2]).applyQuaternion(quaternion);
+    this.camera.up.copy(up);
+    this.camera.position.copy(position);
+    this.camera.lookAt(position.clone().addScaledVector(direction, 10));
+    this.camera.updateMatrixWorld();
+  };
+
+  PointCloudViewer.prototype._mapCentre = function () {
+    if (this.pose) {
+      return new THREE.Vector3(this.pose.x, this.pose.y, this.pose.z);
+    }
+    if (!isFinite(this.bounds.minX)) return new THREE.Vector3(0, 0, 0);
+    return new THREE.Vector3(
+      (this.bounds.minX + this.bounds.maxX) / 2,
+      (this.bounds.minY + this.bounds.maxY) / 2,
+      0);
+  };
+
+  PointCloudViewer.prototype._mapRadius = function () {
+    if (!isFinite(this.bounds.minX)) return 10;
+    var dx = this.bounds.maxX - this.bounds.minX;
+    var dy = this.bounds.maxY - this.bounds.minY;
+    return Math.max(5, Math.sqrt(dx * dx + dy * dy) / 2);
+  };
+
+  PointCloudViewer.prototype._fitTopToMap = function () {
+    var radius = this._mapRadius();
+    var zoom = TOP_HALF / Math.max(radius * 1.1, TOP_HALF);
+    this._setZoom(Math.max(this._zoomMin, Math.min(1, zoom)));
+  };
+
+  PointCloudViewer.prototype.resetMapView = function () {
+    for (var key in this.mapTiles) {
+      if (!this.mapTiles.hasOwnProperty(key)) continue;
+      var mesh = this.mapTiles[key].pointsMesh;
+      if (mesh) {
+        this.mapGroup.remove(mesh);
+        mesh.geometry.dispose();
+      }
+    }
+    this.mapTiles = {};
+    this.mapDirty = {};
+    this._mapDirtyAll = false;
+    this.mapPointCount = 0;
+    this.mapTruncated = false;
+    this.mapZMin = Infinity;
+    this.mapZMax = -Infinity;
+    this.bounds = { minX: Infinity, maxX: -Infinity,
+                    minY: Infinity, maxY: -Infinity };
+    this._mapStride = 1;
+    this._colorRefSpan = 0;
+    this.pose = null;
+    this.trajectoryCount = 0;
+    this.trajAttr.updateRange.offset = 0;
+    this.trajAttr.updateRange.count = 0;
+    this.trajAttr.needsUpdate = true;
+    this.trajectoryLine.geometry.setDrawRange(0, 0);
+    this.sensorGroup.visible = false;
+  };
+
+  PointCloudViewer.prototype.mapStats = function () {
+    return {
+      points: this.mapPointCount,
+      tiles: Object.keys(this.mapTiles).length,
+      trajectory: this.trajectoryCount,
+      truncated: this.mapTruncated
+    };
+  };
+
+  /* ------------------------------ rendering ----------------------------- */
+
   PointCloudViewer.prototype._emitStats = function () {
     this.onStats({
       fps: this._fps,
@@ -502,6 +985,7 @@
       if (!self.active) return;
 
       if (self.controls.enabled) self.controls.update();
+      self._processMapDirty(8);
       self.renderer.render(self.scene, self.viewCamera);
 
       self._renderFrames += 1;

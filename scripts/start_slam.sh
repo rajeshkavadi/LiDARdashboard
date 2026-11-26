@@ -43,6 +43,21 @@ if ! command -v rosrun >/dev/null 2>&1; then
   exit 2
 fi
 
+# The bundled odometry needs scipy (cKDTree).  Ubuntu's python2 has no pip, so
+# vendor/py2 may hold a Python 2.7 scipy wheel that is used when the distro
+# package is not installed.  Check up front instead of letting the import die
+# in the middle of the bag playback log.
+if [ -d "$HERE/vendor/py2/scipy" ]; then
+  export PYTHONPATH="$HERE/vendor/py2:${PYTHONPATH:-}"
+fi
+if [ "$BACKEND" = "builtin" ] \
+   && ! python2 -c "import scipy.spatial" >/dev/null 2>&1; then
+  echo "start_slam: python-scipy is missing, so the built-in odometry cannot run." >&2
+  echo "start_slam:   sudo apt install python-scipy" >&2
+  echo "start_slam:   (or unpack a cp27 scipy wheel into $HERE/vendor/py2)" >&2
+  exit 2
+fi
+
 PIDS=()
 cleanup() {
   for pid in "${PIDS[@]}"; do

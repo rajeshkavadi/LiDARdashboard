@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Start everything needed for the full dashboard, in the right order.
 #
+#   ROS master (roscore, reused when one is already running)
 #   Flux/WebSocket dashboard + Cloudflare tunnel  (python3, port 5000)
 #   live point-cloud bridge                       (ROS python2, tcp 8765)
 #   SLAM (built-in ICP odometry + exporter)       (ROS python2, tcp 8766)
@@ -16,6 +17,9 @@
 #   scripts/start_all.sh --bag=/path/x.bag
 #   NO_TUNNEL=1 scripts/start_all.sh      # skip the Cloudflare tunnel
 #   NO_SLAM=1 / NO_DEM=1 / NO_BRIDGE=1 to leave a component out
+#
+# A bag is played once.  When it reaches the end, every component is stopped
+# and the script exits; Ctrl-C stops everything earlier.
 set -e
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$HERE"
@@ -23,9 +27,9 @@ cd "$HERE"
 usage() {
   echo "usage: $0 [--bag | --bag=<file> | <file.bag>] [--help]" >&2
   echo "  (no argument)       live LiDAR" >&2
-  echo "  --bag               replay the first .bag in $HERE" >&2
+  echo "  --bag               replay the first .bag in $HERE (once)" >&2
   echo "  <file.bag>          replay that bag (also --bag=<file>)" >&2
-  echo "  env: NO_TUNNEL=1 NO_DEM=1 NO_SLAM=1 NO_BRIDGE=1" >&2
+  echo "  env: NO_TUNNEL=1 NO_DEM=1 NO_SLAM=1 NO_BRIDGE=1 BAG_LOOP=--loop" >&2
 }
 
 if [ -f /opt/ros/melodic/setup.bash ]; then
@@ -91,9 +95,16 @@ if [ "${NO_TUNNEL:-0}" = "1" ]; then
 fi
 
 PIDS=()
+BAG_PID=""
 cleanup() {
   for pid in "${PIDS[@]}"; do
     kill "$pid" 2>/dev/null || true
+  done
+  # A component that ignores SIGTERM would keep the port / ROS master busy for
+  # the next run, so give everything a moment and then insist.
+  sleep 1
+  for pid in "${PIDS[@]}"; do
+    kill -9 "$pid" 2>/dev/null || true
   done
 }
 trap cleanup EXIT INT TERM
@@ -125,6 +136,37 @@ if [ "$WEB_READY" != "1" ]; then
   exit 1
 fi
 
+# ROS master.  rosbag, the bridge, the odometry node and the exporter are all
+# ROS nodes: without a master they exit with "Unable to communicate with
+# master", which looks exactly like a dead bridge and an empty dashboard.
+# Reuse a master that is already running, otherwise start one.
+if [ "${NO_SLAM:-0}" != "1" ] || [ "${NO_BRIDGE:-0}" != "1" ] || [ "$PLAY_BAG" = "1" ]; then
+  if ! command -v roscore >/dev/null 2>&1; then
+    echo "[start_all] ERROR: ROS not found; source /opt/ros/melodic/setup.bash" >&2
+    echo "[start_all]        no ROS component was started." >&2
+    exit 1
+  fi
+  if rosnode list >/dev/null 2>&1; then
+    echo "== ROS master (already running at ${ROS_MASTER_URI:-http://localhost:11311}) =="
+  else
+    echo "== ROS master (roscore) =="
+    roscore >"${LIDAR_ROSCORE_LOG:-/tmp/lidar_roscore.log}" 2>&1 &
+    PIDS+=("$!")
+    ROS_READY=0
+    for _ in $(seq 1 60); do
+      if rosnode list >/dev/null 2>&1; then
+        ROS_READY=1
+        break
+      fi
+      sleep 0.25
+    done
+    if [ "$ROS_READY" != "1" ]; then
+      echo "[start_all] ERROR: roscore never came up; see ${LIDAR_ROSCORE_LOG:-/tmp/lidar_roscore.log}" >&2
+      exit 1
+    fi
+  fi
+fi
+
 if [ "${NO_DEM:-0}" != "1" ]; then
   echo "== DEM worker =="
   "$HERE/scripts/start_dem.sh" &
@@ -135,7 +177,8 @@ fi
 if [ "$PLAY_BAG" = "1" ]; then
   echo "== bag playback =="
   "$HERE/scripts/play_bag.sh" "${BAG_ARGS[@]}" &
-  PIDS+=("$!")
+  BAG_PID="$!"
+  PIDS+=("$BAG_PID")
   sleep 2
 fi
 
@@ -153,5 +196,14 @@ fi
 
 echo
 echo "dashboard: http://127.0.0.1:${LIDAR_WEB_PORT:-5000}/"
+if [ -n "$BAG_PID" ]; then
+  echo "the bag plays once; everything stops when it ends (Ctrl+C to stop early)"
+  # Wait only for the playback: when the recording is over there is nothing
+  # left to show, so the whole stack is torn down by the EXIT trap.
+  wait "$BAG_PID" 2>/dev/null || true
+  echo
+  echo "[start_all] bag finished; stopping the dashboard, bridge, SLAM and DEM"
+  exit 0
+fi
 echo "press Ctrl+C to stop everything"
 wait

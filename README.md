@@ -33,6 +33,12 @@ cd ~/LiDARdashboard
 
 The script prints a banner with the local URL and the Cloudflare Quick Tunnel
 URL, then starts each component in order and stops all of them with `Ctrl-C`.
+When a bag was given, it is played **once**: at the end of the recording the
+whole stack (dashboard, tunnel, bridge, SLAM, DEM) is stopped and the script
+exits, so an unattended run cleans up after itself.
+It also starts `roscore` for you (and reuses one that is already running), so
+the manual `roscore` terminal below is only needed when starting components
+individually.
 Open the printed `https://<random>.trycloudflare.com` (or
 `http://127.0.0.1:5000` locally) and use the tabs:
 
@@ -56,9 +62,10 @@ The bag argument needs no flag: a bare path is taken as the recording to
 replay (`--bag=<path>` works too). Relative paths resolve from the repository
 root, `~` expands, and a path that does not exist stops the script with
 `start_all: bag not found: <path>` before anything is started. Without a path,
-`--bag` replays the first `.bag` found in the repository root. `--loop` and the
-rest of the `rosbag play` options are not forwarded by `start_all.sh` — run
-`scripts/play_bag.sh` directly for those.
+`--bag` replays the first `.bag` found in the repository root. The bag plays
+once and the stack shuts down when it ends; set `BAG_LOOP=--loop` to keep it
+repeating until `Ctrl-C`. Other `rosbag play` options are not forwarded by
+`start_all.sh` — run `scripts/play_bag.sh` directly for those.
 
 Remote access needs `cloudflared` in `PATH` (section 8.1). Without it the
 banner prints `CLOUDFLARE STATUS: CLOUDFLARED NOT INSTALLED` and the dashboard
@@ -223,8 +230,21 @@ existing RViz configuration.
 ### 4.1 ROS / bridge (already required by the existing setup)
 
 ```bash
-sudo apt install ros-melodic-rviz python-numpy
+sudo apt install ros-melodic-rviz python-numpy python-scipy
 python -c "import rospy, numpy, sensor_msgs; print('bridge deps OK')"
+python2 -c "import scipy.spatial; print('SLAM deps OK')"
+```
+
+`python-scipy` is only needed by the bundled ICP odometry (`GLOBAL MAP` and
+`DEM`); the live point cloud works without it. A Python 2.7 scipy wheel unpacked
+into `vendor/py2/` is used automatically when the distro package is absent
+(Ubuntu 18.04's Python 2 has no `pip`):
+
+```bash
+pip3 download --no-deps --only-binary=:all: --python-version 27 \
+  --implementation cp --abi cp27mu --platform manylinux1_x86_64 \
+  scipy==1.2.3 -d /tmp/scipy27
+unzip -q /tmp/scipy27/scipy-*.whl -d vendor/py2
 ```
 
 ### 4.2 Web backend (Python 3.6)
@@ -376,7 +396,8 @@ With `roscore` and the bridge running:
 
 ```bash
 cd ~/LiDARdashboard
-./scripts/play_bag.sh             # loops the supplied bag at 1×
+./scripts/play_bag.sh             # plays the supplied bag once at 1×
+BAG_LOOP=--loop ./scripts/play_bag.sh   # repeat it until Ctrl-C
 ./scripts/play_bag.sh OutdoorRoad_cut1.bag -r 2 -u 30   # faster, 30 s
 ```
 
@@ -609,7 +630,9 @@ Expected: `b'LVP1' 20064 <seq> b'livox_frame' 321060`.
 | Symptom | Check |
 | --- | --- |
 | Dashboard shows “No frames” | `rostopic hz /livox/lidar`; bridge log; topic name |
-| Bridge offline in dashboard | backend running and on ingest port 8765; `scripts/start_bridge.sh` log |
+| Bridge offline in dashboard | backend running and on ingest port 8765; `roscore` running (`rosnode list`); `scripts/start_bridge.sh` log |
+| No global map / no DEM | `python2 -c "import scipy.spatial"` (SLAM needs `python-scipy`); SLAM lines in the `start_all.sh` output |
+| “no SLAM topics found” in the log | the exporter waits up to `~topic_wait_s` (120 s) for `/Odometry` + the registered cloud; if it still fails the SLAM backend is not running (`rosnode list`, `rostopic list`) |
 | WS reconnecting | backend process; tunnel logs; firewall |
 | Tunnel URL missing | `/tmp/lidar_cf_tunnel.log`; `cloudflared` in `PATH` |
 | “3D view unavailable” / empty view | browser has no WebGL; see note below |

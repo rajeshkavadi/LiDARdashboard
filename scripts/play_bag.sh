@@ -38,7 +38,9 @@ else
   fi
 fi
 
-LOOP="${BAG_LOOP:---loop}"
+# One pass by default: the recording is played once and the command exits at
+# the end of the bag.  Set BAG_LOOP=--loop to keep replaying it.
+LOOP="${BAG_LOOP:-}"
 
 # Which topics to play: BAG_TOPICS if set, otherwise every PointCloud2 and Imu
 # topic actually present in the bag -- so any recording works without knowing
@@ -58,6 +60,11 @@ else
 fi
 
 echo "play_bag: $BAG"
+if [ -n "$LOOP" ]; then
+  echo "play_bag: looping ($LOOP); Ctrl+C to stop"
+else
+  echo "play_bag: playing once (BAG_LOOP=--loop to repeat)"
+fi
 if [ -n "${TOPICS// /}" ]; then
   echo "play_bag: topics ($SOURCE): $TOPICS"
   # shellcheck disable=SC2086

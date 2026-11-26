@@ -19,6 +19,7 @@ Parameters (private):
     ~backend_name      label shown in the dashboard (default "generic")
     ~odom_topic        default: auto-detect /Odometry
     ~cloud_topic       default: auto-detect /cloud_registered
+    ~topic_wait_s      seconds to wait for those topics to appear (default 120)
     ~server_host       default 127.0.0.1
     ~server_port       default 8766
     ~tile_size         default 20.0 m
@@ -95,17 +96,13 @@ def _autodetect(preferred, candidates, kind, exclude=()):
 class SlamWebBridge(object):
     def __init__(self):
         self.backend_name = rospy.get_param("~backend_name", "generic")
-        self.odom_topic = _autodetect(rospy.get_param("~odom_topic", ""),
-                                      ODOM_CANDIDATES,
-                                      "nav_msgs/Odometry")
-        self.cloud_topic = _autodetect(rospy.get_param("~cloud_topic", ""),
-                                       CLOUD_CANDIDATES,
-                                       "sensor_msgs/PointCloud2", SELF_TOPICS)
-        if not self.odom_topic or not self.cloud_topic:
-            rospy.logerr("[slam_web_bridge] no SLAM topics found. Expected an "
-                         "Odometry topic and a registered PointCloud2 topic. "
-                         "Published: %s"
-                         % ", ".join(sorted(_published_topics().keys())))
+        self.topic_wait_s = float(rospy.get_param("~topic_wait_s", 120.0))
+        if not self._resolve_topics():
+            rospy.logerr("[slam_web_bridge] no SLAM topics found after %.0f s. "
+                         "Expected an Odometry topic and a registered "
+                         "PointCloud2 topic. Published: %s"
+                         % (self.topic_wait_s,
+                            ", ".join(sorted(_published_topics().keys()))))
             raise SystemExit(1)
         self.server_host = rospy.get_param("~server_host", "127.0.0.1")
         self.server_port = int(rospy.get_param("~server_port", 8766))
@@ -142,6 +139,33 @@ class SlamWebBridge(object):
 
         self.stats_timer = rospy.Timer(
             rospy.Duration(10.0), self._log_stats)
+
+    def _resolve_topics(self):
+        """Auto-detect the SLAM contract, waiting for the backend to start.
+
+        The SLAM node is launched just before this one (and an external
+        backend may take seconds to initialise), so a single look at the
+        topic list would often miss it and kill the exporter.
+        """
+        odom_param = rospy.get_param("~odom_topic", "")
+        cloud_param = rospy.get_param("~cloud_topic", "")
+        deadline = time.time() + max(0.0, self.topic_wait_s)
+        waiting_logged = False
+        while True:
+            self.odom_topic = _autodetect(odom_param, ODOM_CANDIDATES,
+                                          "nav_msgs/Odometry")
+            self.cloud_topic = _autodetect(cloud_param, CLOUD_CANDIDATES,
+                                           "sensor_msgs/PointCloud2",
+                                           SELF_TOPICS)
+            if self.odom_topic and self.cloud_topic:
+                return True
+            if rospy.is_shutdown() or time.time() >= deadline:
+                return False
+            if not waiting_logged:
+                log_info("waiting for the SLAM topics (odometry + registered "
+                         "cloud) to be published...")
+                waiting_logged = True
+            time.sleep(0.5)
 
     # -- outbound queue -------------------------------------------------
     def _enqueue(self, message):

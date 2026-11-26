@@ -1,18 +1,24 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""Stream FAST-LIO2 global map, pose and trajectory to the web dashboard.
+"""Stream a SLAM backend's global map, pose and trajectory to the dashboard.
 
-Subscribes (read-only) to the registered scan and odometry published by
-FAST_LIO, voxel-downsamples incoming points per spatial tile, and sends only
-*new* points to the loopback map ingest (default 127.0.0.1:8766).  The web
-backend and Three.js therefore never receive the whole map per frame.
+Subscribes (read-only) to the registered scan and odometry published by *any*
+SLAM backend -- the built-in ``lidar_odometry.py``, FAST-LIO2, Point-LIO,
+LIO-SAM, DLIO, ... -- because they all publish the same contract:
+``nav_msgs/Odometry`` plus a registered ``sensor_msgs/PointCloud2``.  Empty
+topic parameters are auto-detected, so switching backend needs no edits here.
 
-This is not SLAM itself: the pose and the motion-compensated registered cloud
-come from FAST-LIO2.  No raw sensor-relative accumulation is performed.
+Incoming points are voxel-downsampled per spatial tile and only *new* points
+are sent to the loopback map ingest (default 127.0.0.1:8766), so the web
+backend and Three.js never receive the whole map per frame.
+
+This is not SLAM itself: poses and the registered cloud come from the backend.
+No raw sensor-relative accumulation is performed.
 
 Parameters (private):
-    ~odom_topic        default /Odometry
-    ~cloud_topic       default /cloud_registered
+    ~backend_name      label shown in the dashboard (default "generic")
+    ~odom_topic        default: auto-detect /Odometry
+    ~cloud_topic       default: auto-detect /cloud_registered
     ~server_host       default 127.0.0.1
     ~server_port       default 8766
     ~tile_size         default 20.0 m
@@ -50,10 +56,57 @@ def log_info(message):
     rospy.loginfo("[slam_web_bridge] " + message)
 
 
+# Hints only: any nav_msgs/Odometry and any registered PointCloud2 topic is
+# accepted, so an unfamiliar backend still works without configuration.
+ODOM_CANDIDATES = ("/Odometry", "/odometry", "/odom", "/Odometry_high_rate",
+                   "/lio_sam/mapping/odometry", "/lio_sam/mapping/odometry_incremental",
+                   "/aft_mapped_to_init", "/point_lio/odometry",
+                   "/dlio/odom_node/odom", "/fast_lio/odometry",
+                   "/slam/odometry", "/odometry/filtered")
+CLOUD_CANDIDATES = ("/cloud_registered", "/cloud_registered_body",
+                    "/lio_sam/mapping/cloud_registered",
+                    "/lio_sam/mapping/cloud_registered_body",
+                    "/point_lio/cloud_registered", "/dlio/odom_node/pointcloud",
+                    "/fast_lio/cloud_registered", "/registered_scan",
+                    "/slam/cloud_registered")
+SELF_TOPICS = ("/points",)  # never feed raw input back as the registered map
+
+
+def _published_topics():
+    try:
+        return dict(rospy.get_published_topics())
+    except Exception:  # noqa: BLE001 - mastership race at startup
+        return {}
+
+
+def _autodetect(preferred, candidates, kind, exclude=()):
+    if preferred:
+        return preferred
+    available = _published_topics()
+    for name in candidates:
+        if name in available and kind in available[name]:
+            return name
+    for name in sorted(available):
+        if name not in exclude and kind in available[name]:
+            return name
+    return None
+
+
 class SlamWebBridge(object):
     def __init__(self):
-        self.odom_topic = rospy.get_param("~odom_topic", "/Odometry")
-        self.cloud_topic = rospy.get_param("~cloud_topic", "/cloud_registered")
+        self.backend_name = rospy.get_param("~backend_name", "generic")
+        self.odom_topic = _autodetect(rospy.get_param("~odom_topic", ""),
+                                      ODOM_CANDIDATES,
+                                      "nav_msgs/Odometry")
+        self.cloud_topic = _autodetect(rospy.get_param("~cloud_topic", ""),
+                                       CLOUD_CANDIDATES,
+                                       "sensor_msgs/PointCloud2", SELF_TOPICS)
+        if not self.odom_topic or not self.cloud_topic:
+            rospy.logerr("[slam_web_bridge] no SLAM topics found. Expected an "
+                         "Odometry topic and a registered PointCloud2 topic. "
+                         "Published: %s"
+                         % ", ".join(sorted(_published_topics().keys())))
+            raise SystemExit(1)
         self.server_host = rospy.get_param("~server_host", "127.0.0.1")
         self.server_port = int(rospy.get_param("~server_port", 8766))
         self.tile_size = float(rospy.get_param("~tile_size", 20.0))
@@ -99,7 +152,8 @@ class SlamWebBridge(object):
 
     def _hello_bytes(self):
         hello = {
-            "role": "fast-lio2-exporter",
+            "role": "slam-exporter",
+            "backend": self.backend_name,
             "odom_topic": self.odom_topic,
             "cloud_topic": self.cloud_topic,
             "tile_size_m": self.tile_size,
@@ -118,6 +172,9 @@ class SlamWebBridge(object):
                     sock = socket.create_connection(
                         (self.server_host, self.server_port), timeout=5.0)
                     sock.settimeout(None)
+                    # The backend clears its map for a new session, so the
+                    # exporter must forget what it already sent and replay.
+                    self._reset()
                     sock.sendall(self._hello_bytes())
                     self.sock = sock
                     log_info("connected to web map ingest")
@@ -155,7 +212,8 @@ class SlamWebBridge(object):
                     break
                 if head[:4] != protocol.MAP_MAGIC:
                     break
-                msg_type = ord(head[4]) if not isinstance(head[4], int) else head[4]
+                msg_type = (head[4] if isinstance(head[4], int)
+                            else ord(head[4]))
                 if msg_type == protocol.MAP_RESET:
                     self._reset()
         except (socket.error, OSError):
@@ -177,7 +235,7 @@ class SlamWebBridge(object):
                 return None
             chunks.append(chunk)
             remaining -= len(chunk)
-        return "".join(chunks)
+        return b"".join(chunks)
 
     def _reset(self):
         with self.lock:
@@ -192,7 +250,7 @@ class SlamWebBridge(object):
                 break
         log_info("map reset received; cleared local voxel/trajectory state")
 
-    # -- FAST-LIO input -------------------------------------------------
+    # -- SLAM backend input ----------------------------------------------
     def _on_odom(self, msg):
         position = msg.pose.pose.position
         orientation = msg.pose.pose.orientation
@@ -202,7 +260,9 @@ class SlamWebBridge(object):
                                  orientation.z, orientation.w)
         self._enqueue(pose)
 
-        distance = 0.0
+        # The first pose always seeds the trajectory, otherwise the very first
+        # message would return early and the path would never start.
+        distance = float("inf")
         if self.last_traj_xyz is not None:
             dx = position.x - self.last_traj_xyz[0]
             dy = position.y - self.last_traj_xyz[1]

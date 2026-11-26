@@ -148,6 +148,76 @@ def parse_pose(payload):
     return MAP_POSE_STRUCT.unpack_from(payload, 0)
 
 
+class MapStreamDecoder(object):
+    """Split concatenated LVM1 messages from a byte stream.
+
+    Used by the DEM service, which reads the map stream over loopback HTTP and
+    needs complete messages without knowing the boundaries in advance.
+    """
+
+    def __init__(self):
+        self._buffer = b""
+
+    def feed(self, data):
+        self._buffer += data
+        messages = []
+        while True:
+            # Skip keepalive/unframed bytes until the next magic value.
+            if (len(self._buffer) >= ENVELOPE.size and
+                    self._buffer[:4] != MAP_MAGIC):
+                self._buffer = self._buffer[1:]
+                continue
+            message, consumed = self._next()
+            if message is None:
+                break
+            messages.append(message)
+            self._buffer = self._buffer[consumed:]
+        return messages
+
+    def _next(self):
+        buffer = self._buffer
+        if len(buffer) < ENVELOPE.size:
+            return None, 0
+        magic, msg_type = ENVELOPE.unpack_from(buffer, 0)
+        if magic != MAP_MAGIC:
+            # Corrupt framing: drop one byte and resynchronise.
+            return None, 0
+        head = ENVELOPE.size
+        if msg_type == MAP_RESET:
+            return buffer[:head], head
+        if msg_type == MAP_POSE:
+            size = head + MAP_POSE_STRUCT.size
+        elif msg_type == MAP_TRAJECTORY:
+            if len(buffer) < head + MAP_TRAJ_HEADER.size:
+                return None, 0
+            count = struct.unpack_from("<II", buffer, head)[1]
+            size = head + MAP_TRAJ_HEADER.size + count * TRAJ_POINT_BYTES
+        elif msg_type == MAP_TILE_ADD:
+            if len(buffer) < head + MAP_TILE_HEADER.size:
+                return None, 0
+            count = struct.unpack_from("<iiiI", buffer, head)[3]
+            size = head + MAP_TILE_HEADER.size + count * POINT_BYTES
+        else:
+            return None, 0
+        if len(buffer) < size:
+            return None, 0
+        return buffer[:size], size
+
+
+def iter_tile_points(message):
+    """Return (tx, ty, tz, Nx3 float32 numpy array) for a TILE_ADD message."""
+    msg_type, payload = parse_map_message(message)
+    if msg_type != MAP_TILE_ADD:
+        return None
+    parsed = parse_tile(payload)
+    if parsed is None:
+        return None
+    tx, ty, tz, count, body = parsed
+    import numpy as np
+    points = np.frombuffer(body, dtype="<f4").reshape(count, 4)
+    return tx, ty, tz, points
+
+
 def parse_dem_message(data):
     if len(data) < ENVELOPE.size:
         return None, None, None

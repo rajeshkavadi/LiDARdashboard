@@ -1,7 +1,14 @@
-"""Loopback TCP ingest for the FAST-LIO2 exporter (default port 8766).
+"""Loopback TCP ingest for the SLAM exporter (default port 8766).
 
-This port must never be exposed through Cloudflare; it carries the global map,
-pose and trajectory updates and accepts a reset instruction for the exporter.
+Any SLAM backend (built-in lidar_odometry.py, FAST-LIO2, Point-LIO, LIO-SAM)
+can feed this port; it only needs the LVM1 tile/pose/trajectory messages from
+``protocol.py``.  This port must never be exposed through Cloudflare.
+
+A new exporter connection starts a new mapping session: the in-memory map is
+cleared so a restarted SLAM node (whose tile and trajectory indices begin at
+zero again) cannot produce duplicated tiles or a permanently broken
+trajectory.  ``on_new_session`` lets the application clear dependent state
+(the DEM) at the same moment.
 """
 
 import json
@@ -29,10 +36,12 @@ def _recv_exact(sock, size):
 
 
 class MapIngestServer(object):
-    def __init__(self, hub, host="127.0.0.1", port=8766):
+    def __init__(self, hub, host="127.0.0.1", port=8766,
+                 on_new_session=None):
         self.hub = hub
         self.host = host
         self.port = port
+        self.on_new_session = on_new_session
         self._stop = threading.Event()
         self._socket = None
         self._clients = set()
@@ -106,6 +115,14 @@ class MapIngestServer(object):
                     except ValueError:
                         meta = {}
                     meta["peer"] = peer
+                    # New exporter = new mapping session: clear stale map and
+                    # dependent state so indices and tiles line up again.
+                    self.hub.reset()
+                    if self.on_new_session is not None:
+                        try:
+                            self.on_new_session(meta)
+                        except Exception:  # noqa: BLE001 - never break ingest
+                            pass
                     self.hub.set_slam_connection(True, peer, meta)
                     conn.settimeout(None)
                     continue

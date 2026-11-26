@@ -17,6 +17,77 @@ Cloudflare Tunnel only proxies the local web app.
 
 ---
 
+## Quick start — one command
+
+Everything (web backend + Cloudflare tunnel + ROS bridge + SLAM + DEM worker)
+is started by a single script. From the repository root:
+
+```bash
+cd ~/LiDARdashboard
+./scripts/start_all.sh                     # full stack, live LiDAR
+./scripts/start_all.sh --bag              # full stack + replay the default bag
+./scripts/start_all.sh /path/to/other.bag # full stack + replay that bag
+./scripts/start_all.sh --bag=/path/other.bag
+./scripts/start_all.sh --help
+```
+
+The script prints a banner with the local URL and the Cloudflare Quick Tunnel
+URL, then starts each component in order and stops all of them with `Ctrl-C`.
+Open the printed `https://<random>.trycloudflare.com` (or
+`http://127.0.0.1:5000` locally) and use the tabs:
+
+| Tab | Should show |
+|---|---|
+| **Dashboard** | LiDAR, bridge, stream, WebSocket, tunnel and RViz all green |
+| **View → LIVE** | ~10 fps, ~20,000 points/frame |
+| **View → GLOBAL MAP** | point count and trajectory growing in real time |
+| **Terrain / DEM** | `has_grid: true`, tiles filling in, elevation range in metres |
+
+Useful variants:
+
+```bash
+NO_TUNNEL=1 ./scripts/start_all.sh --bag          # offline; no cloudflared needed
+NO_DEM=1    ./scripts/start_all.sh --bag          # skip the DEM worker
+NO_SLAM=1   ./scripts/start_all.sh --bag          # LIVE view only, no global map
+NO_TUNNEL=1 ./scripts/start_all.sh ~/bags/site2.bag   # any bag, anywhere
+```
+
+The bag argument needs no flag: a bare path is taken as the recording to
+replay (`--bag=<path>` works too). Relative paths resolve from the repository
+root, `~` expands, and a path that does not exist stops the script with
+`start_all: bag not found: <path>` before anything is started. Without a path,
+`--bag` replays the first `.bag` found in the repository root. `--loop` and the
+rest of the `rosbag play` options are not forwarded by `start_all.sh` — run
+`scripts/play_bag.sh` directly for those.
+
+Remote access needs `cloudflared` in `PATH` (section 8.1). Without it the
+banner prints `CLOUDFLARE STATUS: CLOUDFLARED NOT INSTALLED` and the dashboard
+keeps working on `http://127.0.0.1:5000`; use `NO_TUNNEL=1` to silence the
+install hint.
+
+If the backend cannot start (bad port, missing dependency), `start_all.sh`
+stops immediately with `[start_all] ERROR: the web backend never answered ...`
+instead of starting the other components against a dead port.
+
+Stop everything by pressing `Ctrl-C` in the terminal that ran `start_all.sh`.
+Each component can also be run on its own — see section 13.2.
+
+### What a healthy run looks like
+
+Measured on this machine (Ubuntu 18.04, ROS Melodic, `OutdoorRoad_cut1.bag`)
+with `NO_TUNNEL=1 ./scripts/start_all.sh --bag`:
+
+| Quantity | Result |
+|---|---|
+| Live point cloud | 10.18 fps, 20,064 points/frame, topic auto-detected as `/mid360/livox/lidar` |
+| SLAM backend | `builtin` (bundled ICP odometry) on `/Odometry` |
+| Global map | 568,665 voxel points over 169 tiles |
+| Trajectory | 445 points, ~50 m path |
+| DEM | `has_grid: true`, 128×139 cells @ 0.5 m, `error: null` |
+| Exports | `current.tif`, `ground_points.pcd`, `dem_meta.json` in `/tmp/lidar_dem` |
+
+---
+
 ## 1. Verified environment and data source
 
 | Item | Value |
@@ -25,19 +96,19 @@ Cloudflare Tunnel only proxies the local web app.
 | ROS | Melodic (`/opt/ros/melodic`, Python 2.7 rospy) |
 | Web runtime | Python 3.6.9 |
 | LiDAR | Livox Mid-360 |
-| ROS topic | `/livox/lidar` |
+| ROS topic | `/mid360/livox/lidar` (bridges auto-detect; `/livox/lidar` also works) |
 | Message type | `sensor_msgs/PointCloud2` |
-| Frame | `livox_frame` |
+| Frame | `mid360_frame` (`livox_frame` on legacy drivers) |
 | Fields | `x`, `y`, `z`, `intensity` (float32), plus `tag`, `line`, `timestamp` |
 | Point step | 26 bytes |
 | Rate | 10 Hz |
 | Points per frame | ~20,000 |
-| Recording | `20261030_221123_mid360s.bag` (3:38, 1.1 GB, 2,187 LiDAR frames) |
+| Recording | `OutdoorRoad_cut1.bag` (45 s, 3.1 GB, 453 LiDAR frames) |
 
 The point-cloud topic, message type, field offsets, frame id and rate above
 were read from the supplied bag; nothing here assumes a different topic.
 
-**Coordinate frame.** `livox_frame` follows the standard ROS / Livox
+**Coordinate frame.** `livox_frame` / `mid360_frame` follow the standard ROS / Livox
 convention: **X forward, Y left, Z up**. The camera presets use exactly this
 convention. If your sensor is mounted rotated on the robot, change the `VIEWS`
 table in `webapp/static/js/viewer.js` (one line per direction) rather than
@@ -110,8 +181,8 @@ ranges are re-uploaded.
 ## 3. Project structure
 
 ```
-rviz_web_app/
-├── 20261030_221123_mid360s.bag          # recording (unmodified)
+LiDARdashboard/
+├── OutdoorRoad_cut1.bag                 # recording (unmodified)
 ├── README.md
 ├── requirements.txt
 ├── scripts/
@@ -142,7 +213,7 @@ rviz_web_app/
 
 **Newly created:** everything listed above except the bag.
 **Modified existing files:** none — the original directory contained only the
-bag. **Unmodified:** `20261030_221123_mid360s.bag`, the Livox driver, and any
+bag. **Unmodified:** `OutdoorRoad_cut1.bag`, the Livox driver, and any
 existing RViz configuration.
 
 ---
@@ -159,7 +230,7 @@ python -c "import rospy, numpy, sensor_msgs; print('bridge deps OK')"
 ### 4.2 Web backend (Python 3.6)
 
 ```bash
-cd ~/rviz_web_app
+cd ~/LiDARdashboard
 python3 -m pip install --user -r requirements.txt
 ```
 
@@ -189,8 +260,12 @@ Run each component in its own terminal.
 
 ### 5.0 Quick start — four terminals + a browser
 
-Exact launch order, verified with `20261030_221123_mid360s.bag`. Skip
-Terminal 4 and start the real driver (5.1) instead when the sensor is in use.
+Exact launch order, verified with `OutdoorRoad_cut1.bag`. Skip Terminal 4 and
+start the real driver (5.1) instead when the sensor is in use.
+
+**One command instead of four terminals:** `./scripts/start_all.sh` starts the
+backend (with tunnel), the live bridge, SLAM and the DEM worker; add `--bag` to
+replay the recording too. See section 13.
 
 **Terminal 1 — ROS master**
 
@@ -202,7 +277,7 @@ roscore
 **Terminal 2 — web backend**
 
 ```bash
-cd ~/rviz_web_app
+cd ~/LiDARdashboard
 ./scripts/start_web.sh
 ```
 
@@ -211,7 +286,7 @@ Wait for `Running on http://127.0.0.1:5000`.
 **Terminal 3 — ROS → web bridge**
 
 ```bash
-cd ~/rviz_web_app
+cd ~/LiDARdashboard
 ./scripts/start_bridge.sh
 ```
 
@@ -220,7 +295,7 @@ Wait for `subscribed to /livox/lidar` and `connected to web backend`.
 **Terminal 4 — replay the bag**
 
 ```bash
-cd ~/rviz_web_app
+cd ~/LiDARdashboard
 ./scripts/play_bag.sh
 ```
 
@@ -255,13 +330,13 @@ source /opt/ros/melodic/setup.bash
 Do not start a second driver. RViz can run at the same time as before:
 
 ```bash
-rviz -d ~/rviz_web_app/ros_pkg/lidar_web_bridge/rviz/lidar_view.rviz
+rviz -d ~/LiDARdashboard/ros_pkg/lidar_web_bridge/rviz/lidar_view.rviz
 ```
 
 ### 5.2 Web backend
 
 ```bash
-cd ~/rviz_web_app
+cd ~/LiDARdashboard
 ./scripts/start_web.sh
 ```
 
@@ -274,7 +349,7 @@ The dashboard works locally even with no ROS running and with the tunnel off.
 ### 5.3 ROS bridge
 
 ```bash
-cd ~/rviz_web_app
+cd ~/LiDARdashboard
 ./scripts/start_bridge.sh
 ```
 
@@ -300,9 +375,9 @@ roslaunch lidar_web_bridge lidar_web.launch rviz:=true
 With `roscore` and the bridge running:
 
 ```bash
-cd ~/rviz_web_app
+cd ~/LiDARdashboard
 ./scripts/play_bag.sh             # loops the supplied bag at 1×
-./scripts/play_bag.sh 20261030_221123_mid360s.bag -r 2 -u 30   # faster, 30 s
+./scripts/play_bag.sh OutdoorRoad_cut1.bag -r 2 -u 30   # faster, 30 s
 ```
 
 Replaying the bag does not touch the live driver; stop it when the real
@@ -454,7 +529,7 @@ colour ramp is the exact range.
 With the backend already running:
 
 ```bash
-cd ~/rviz_web_app
+cd ~/LiDARdashboard
 ./scripts/start_tunnel.sh
 ```
 
@@ -565,6 +640,243 @@ should show live points and ~10 FPS.
 ## 12. Scope
 
 Intentionally excluded: object detection, PointPillars, ML/inference,
-3D bounding boxes, classification, tracking, cloud-side processing, and any
-modification of the Livox driver or existing RViz workflow.
+3D bounding boxes, object classification/tracking, georeferencing (GPS, NMEA,
+UTM, WGS84), PTP time sync, and any modification of the Livox driver or RViz
+workflow.
 
+Included since section 13: local SLAM (plug-in backends), global map,
+trajectory and incremental DEM/GeoTIFF generation — all in local coordinates.
+
+
+---
+
+## 13. Global mapping (SLAM), trajectory and DEM
+
+The **GLOBAL MAP** tab is fed by a real SLAM pipeline: motion-compensated
+scans are registered into one global frame, and the map, sensor trajectory and
+terrain grid accumulate across the whole session. Raw sensor-relative points
+are never accumulated.
+
+### 13.1 Backends (agnostic by design)
+
+Any backend that publishes the usual ROS contracts works:
+
+| Backend | Status | Notes |
+|---|---|---|
+| `lidar_odometry.py` (bundled, default) | works out of the box | numpy/scipy ICP + IMU deskew; no build, no network |
+| FAST-LIO2 | drop-in | set `SLAM_BACKEND=external`, run FAST-LIO2 yourself |
+| Point-LIO / LIO-SAM / DLIO | drop-in | same contract: `nav_msgs/Odometry` + registered `PointCloud2` |
+
+The exporter (`slam_web_bridge.py`) auto-detects the odometry topic
+(`/Odometry`, `/lio_sam/mapping/odometry`, ...) and the registered cloud
+(`/cloud_registered`, `/point_lio/cloud_registered`, ...). Nothing in the web
+app knows which SLAM produced the data; the dashboard shows the backend label
+from the exporter handshake.
+
+The bundled odometry is deliberately small: voxel downsampling, point-to-plane
+free ICP with an Umeyama fit, a local voxel map, and scan deskew from the real
+per-point `timestamp` field plus IMU gyro. It is not a loop-closing SLAM; it
+drifts on long loops, which is why FAST-LIO2 stays a first-class option.
+
+### 13.2 Commands
+
+```bash
+# everything (backend + tunnel + bridge + SLAM + DEM)
+./scripts/start_all.sh
+./scripts/start_all.sh --bag          # plus bag replay (first .bag in repo root)
+./scripts/start_all.sh /path/to/x.bag # plus replay of a specific bag
+./scripts/start_all.sh --bag=/path/to/x.bag
+./scripts/start_all.sh --help         # argument summary
+
+# components individually
+./scripts/start_web.sh                # dashboard + Cloudflare tunnel
+./scripts/start_bridge.sh             # live point cloud (tcp 8765)
+./scripts/start_slam.sh               # SLAM + exporter (tcp 8766)
+./scripts/start_dem.sh                # incremental DEM worker
+./scripts/play_bag.sh                 # auto-finds the .bag in the repo root
+
+# use FAST-LIO2 (or any other backend) instead of the bundled odometry
+SLAM_BACKEND=external SLAM_NAME=fast-lio2 ./scripts/start_slam.sh
+```
+
+Every bridge and SLAM node auto-detects its topics, so Mid-360
+(`/mid360/livox/lidar`), legacy Livox (`/livox/lidar`) and Ouster bags need no
+arguments. Override with `TOPIC=`, `LIDAR_TOPIC=`, `IMU_TOPIC=`.
+
+### 13.2.1 Using a different dataset
+
+Anything that publishes `sensor_msgs/PointCloud2` works — the topic name does
+not have to be on any list:
+
+```bash
+./scripts/start_all.sh /workspace/datasets/demo1.bag
+```
+
+Topic resolution is layered, so an unfamiliar or partly-renamed recording still
+runs without configuration:
+
+1. `~topic` / `~lidar_topic` / `LIDAR_TOPIC` if you set one (tried first, but
+   not exclusive — a stale value cannot make the node deaf).
+2. A built-in candidate list: `/livox/lidar`, `/livox/lidar_custom`,
+   `/livox/lidar_raw`, `/livox/points`, `/livox/lidar_front|left|right|1|2`,
+   `/mid360/livox/lidar`, `/mid360/lidar`, `/avia/livox/lidar`,
+   `/horizon/livox/lidar`, `/ouster/points`, `/os_cloud_node/points`,
+   `/velodyne_points`, `/hesai/points`, `/rslidar_points`,
+   `/lslidar_point_cloud`, `/points`, `/points_raw`, `/lidar_points`,
+   `/cloud`, `/scan_cloud`, `/sensor_points`.
+3. Any topic whose name contains `livox`, `mid360`, `lidar`, `velodyne`,
+   `ouster`, `hesai`, `rslidar`, `scan`, `points` or `cloud`.
+4. Any remaining `sensor_msgs/PointCloud2` topic.
+
+All candidates are subscribed at once and the node **locks onto the first one
+that actually delivers frames**; a topic that is registered but silent (a dead
+publisher, a leftover parameter) is ignored. If a bag carries several LiDARs,
+the better-ranked topic takes over within the first 5 frames and the rest are
+dropped. IMU topics resolve the same way (`/livox/imu`, `/mid360/livox/imu`,
+`/imu`, `/imu/data`, `/imu/data_raw`, `/imu_raw`, `/ouster/imu`, `/vn100/imu`,
+…); an IMU is optional — without one the odometry runs LiDAR-only.
+
+`play_bag.sh` also adapts: it replays every `sensor_msgs/PointCloud2` and
+`sensor_msgs/Imu` topic it finds in the bag (not a fixed list), and replays the
+whole bag if it finds none. Set `BAG_TOPICS="/a /b"` to override.
+
+The cloud is parsed from its real `PointField` layout, so `x,y,z,intensity`,
+`x,y,z,rgb` (Velodyne-style packed colour, used as intensity) and float64
+variants all work. Dense sensors are handled too: frames above ~12k points are
+decimated for SLAM (`process_stride=0`, automatic) while the LIVE view keeps
+the full cloud — a 167k-point/frame bag still runs at ~10 fps.
+
+### 13.3 Configuration
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `SLAM_BACKEND` | `builtin` | `builtin` or `external` |
+| `SLAM_NAME` | = backend | label shown in the dashboard |
+| `DESKEW` | `1` | per-point motion compensation |
+| `DEM_RESOLUTION` | `0.5` | DEM cell size (m) |
+| `LIDAR_DEM_DIR` | `/tmp/lidar_dem` | exports directory |
+| `LIDAR_PDAL_BIN` | auto | explicit `pdal` binary |
+
+Odometry tuning is exposed as private ROS params: `~voxel_size` (0.35),
+`~map_voxel` (0.5), `~max_iterations` (12), `~max_correspondence` (1.0),
+`~max_map_points` (250,000), `~process_stride`, `~deskew`.
+
+DEM parameters: `--resolution`, `--tile-size` (20 m accumulation),
+`--batch-points`, `--max-pending-points`, `--max-halo-points`,
+`--export-interval`, and the SMRF set `--smrf-cell/slope/threshold/window`.
+
+### 13.4 How the DEM is produced
+
+1. The exporter voxel-downsamples the registered cloud per 20 m tile and sends
+   only *new* points to the backend (loopback tcp 8766), so the browser never
+   receives the whole map per frame.
+2. `webapp/dem_service.py` reads the same stream over loopback HTTP
+   (`/internal/map/stream`), accumulates points per 20 m tile, and classifies
+   ground with **PDAL** `filters.smrf` → `filters.range Classification[2:2]`.
+   Only the centre tile is committed; its 3×3 neighbourhood acts as a halo so
+   tile borders classify consistently.
+3. Ground returns are aggregated to the **lowest** z per cell. Cells with no
+   ground return stay `NoData` (NaN on the wire, `-9999` in exports) — the
+   service never interpolates or invents elevations.
+4. Updates are sent as `LVD1` FULL (extent changed) or PATCH rectangles
+   (0.5 s throttle); a rejected PATCH returns HTTP 409 and the service resends
+   a FULL grid, so a backend restart cannot wedge the DEM.
+5. Tiles that stop growing are flushed after 8 s, so thin areas are not stuck
+   waiting for a full batch.
+
+If PDAL is missing, a numpy morphological filter (minimum surface + slope
+tolerance) is used instead; the dashboard reports which classifier ran.
+
+**All coordinates are local metres in the SLAM map frame.** There is no CRS,
+no georeferencing, no GPS/NMEA and no PTP anywhere in this pipeline.
+
+### 13.5 Exports (local coordinates only)
+
+Written to `$LIDAR_DEM_DIR` (`/tmp/lidar_dem` by default):
+
+| File | Content |
+|---|---|
+| `current.tif` | GeoTIFF, `output_type=min`, `nodata=-9999`, cell size = `--resolution` |
+| `ground_points.pcd` | classified ground returns (ASCII PCD) |
+| `dem_meta.json` | origin, extent, resolution, elevation range, classifier, counts |
+
+The files carry no projection: the dashboard and the JSON state explicitly
+that X/Y are relative metres from the map origin. Loading them into QGIS/GDAL
+requires the user to declare a local CRS deliberately.
+
+### 13.6 Verification performed
+
+All of the following was run on this machine (Ubuntu 18.04, ROS Melodic,
+Python 2.7 / 3.6.9, `OutdoorRoad_cut1.bag`, 3.1 GB, 453 frames).
+
+- **Odometry offline** (`tools/odometry_eval.py`): 453 frames at 41.7 fps
+  offline / 10.07 Hz real time, **0 rejected frames**, path 49.9 m with 28.2 m
+  net displacement.
+- **Repeatability**: the same scan fed 30× drifts **1.3 mm** — the ICP does not
+  accumulate error on stationary data.
+- **Live node**: `lidar_odometry.py` ran at 10.07 Hz against the bag with
+  `_lidar_topic:=/mid360/livox/lidar _imu_topic:=/mid360/livox/imu`.
+- **Point-cloud bridge**: `/mid360/livox/lidar` auto-detected, 10.18 fps,
+  20,064 points/frame.
+- **Full one-command run** (`NO_TUNNEL=1 ./scripts/start_all.sh --bag`):
+  cloud 10.18 fps / 20,064 pts, map **568,665 points / 169 tiles**,
+  trajectory **445 points**, backend label `builtin`, DEM `has_grid: true`,
+  grid 128×139 @ 0.5 m, `error: null`, all three exports present.
+- **Larger replay**: map 800k+ voxel points / 160+ tiles, trajectory 400+
+  points, DEM grid ~170×170 cells @ 0.5 m, elevation span −6.0…1.6 m.
+- **Ground classifier sanity check**: PDAL kept 85% of true ground returns and
+  **0%** of the +1.5…3 m above-ground layer.
+- **`current.tif`**: valid classic little-endian GeoTIFF (`II*` magic,
+  205 KB); PDAL 1.6 has no `readers.gdal`, so it was validated by TIFF header
+  and cell-by-cell comparison against the grid in memory.
+- **Bugs found by these runs and fixed**: `_match_ground` marking every point
+  as ground (elevations up to 54 m); numpy 1.13 `savetxt` failure on an open
+  float handle (now binary PLY plus a temp-file spill); grid-growth tuple
+  crash in the DEM loop; DEM PATCH wedging permanently after a lost FULL grid
+  (now HTTP 409 → resend FULL).
+- `python2 -m py_compile` / `python3 -m py_compile` clean on every script, and
+  `bash -n` clean on every shell script. No pytest suite exists in this repo.
+
+#### A second dataset with a completely different layout
+
+`/workspace/datasets/demo1.bag` — 10 s, 101 frames, **167,616 points/frame**,
+fields `x,y,z,rgb` (no `intensity`, no per-point `timestamp`), single topic
+`/livox/lidar`, **no IMU**, 32-byte point step:
+
+| Quantity | Result |
+|---|---|
+| Topic resolution | locked onto `/livox/lidar` (packed `rgb` used as intensity) |
+| Live cloud | 10.04 fps, 152,400–169,200 points/frame |
+| SLAM rate | 9.5 frames/s offline (`tools/odometry_eval.py`), 101 frames, 0 rejected |
+| Trajectory | 188.2 m path, 188.1 m net, 97% inliers |
+| Global map | 1.07M points over 644 tiles, 169 trajectory points |
+| DEM | `has_grid: true`, 1180×168 cells, 12,159 ground points, `error: null` |
+| Exports | `current.tif`, `ground_points.pcd`, `dem_meta.json` written |
+
+No IMU means no deskew and no gyro prior for this bag; the odometry still
+tracks the 68 km/h drive without a rejected frame. Two bugs were found by this
+run and fixed: the point-field `dtype` builder rejected **every** frame on a
+cloud without an `intensity` field (see the fix notes below), and the bundled
+ICP ran at 1.6 fps on 167k-point frames until automatic decimation was added.
+
+### 13.7 Known limitations
+
+- The bundled odometry has no loop closure, so `GLOBAL MAP` drifts on long
+  loops; use FAST-LIO2 for production mapping.
+- `/gnss_pose` in `OutdoorRoad_cut1.bag` is static (≈1e-7 m between messages),
+  so trajectory accuracy in this repo is **not** verified against ground truth.
+- SMRF runs per tile batch with a 3×3 halo, not globally, so tile seams can
+  differ slightly on steep terrain.
+- GeoTIFF export rewrites the whole raster every 20 s; on very large maps that
+  is the slowest part of the worker (it never blocks the dashboard).
+- The map is held in memory (export defaults to a 1.5M ground-point buffer and
+  bounded pending tiles); nothing is persisted to disk beyond the exports.
+- The Cloudflare Quick Tunnel auto-start path was **not** exercised during these
+  runs (`cloudflared` is not installed on this machine); sections 8.1 and 13.2
+  describe the expected behaviour, and `NO_TUNNEL=1` was used for verification.
+- SLAM decimates dense frames to ~12,000 points (`target_points_per_frame` in
+  `slam_core.py`) to stay real time; the LIVE view always gets the full cloud.
+  Raise it for denser maps at the cost of frame rate.
+- A bag with several LiDARs registers all of them; the node picks the
+  best-ranked one within the first 5 frames. Set `LIDAR_TOPIC` / `TOPIC` to
+  force a specific sensor.

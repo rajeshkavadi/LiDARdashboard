@@ -150,13 +150,48 @@ def dem_socket(ws):
         app.logger.debug("dem websocket closed: %r", exc)
 
 
+@app.route("/internal/map/stream")
+def internal_map_stream():
+    """Loopback raw LVM1 stream for the DEM service (snapshot + deltas).
+
+    Same data the browser receives on /ws/map, but as a plain byte stream so
+    the DEM worker needs no WebSocket client library.
+    """
+    if not _local_request():
+        return jsonify({"error": "loopback only"}), 403
+
+    def generate():
+        messages, last_seq = map_hub.snapshot()
+        for message in messages:
+            yield message
+        while True:
+            messages, new_seq, resync = map_hub.wait_for_updates(
+                last_seq, timeout=5.0)
+            if resync:
+                messages, new_seq = map_hub.snapshot()
+            for message in messages:
+                yield message
+            last_seq = new_seq
+            if not messages:
+                yield b"\x00"  # keepalive; decoder ignores it
+
+    return Response(
+        stream_with_context(generate()),
+        mimetype="application/octet-stream",
+        headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"})
+
+
 @app.route("/internal/dem/patch", methods=["POST"])
 def internal_dem_patch():
     if not _local_request():
         return jsonify({"error": "loopback only"}), 403
     data = request.get_data(cache=False)
     ok = dem_hub.apply_message(data)
-    return jsonify({"ok": bool(ok)}), (200 if ok else 400)
+    if ok:
+        return jsonify({"ok": True}), 200
+    # 409 tells the DEM service it must resend a full grid (e.g. the backend
+    # restarted, or the grid shape changed while it was computing).
+    return jsonify({"ok": False, "need_full": True}), 409
 
 
 @app.route("/internal/dem/status", methods=["POST"])
@@ -253,12 +288,15 @@ def api_dem_export_json():
 def print_banner(port, tunnel_manager):
     local = "http://127.0.0.1:%d" % port
     status = tunnel_manager.status() if tunnel_manager is not None else {}
-    remote = status.get("url") or "starting…" if status.get("enabled") else "disabled"
-    state = (status.get("state") or "disabled").upper()
     if not status.get("enabled"):
+        remote = "disabled"
         state = "DISABLED"
     elif status.get("installed") is False:
+        remote = "unavailable (cloudflared not installed)"
         state = "CLOUDFLARED NOT INSTALLED"
+    else:
+        remote = status.get("url") or "starting..."
+        state = (status.get("state") or "unknown").upper()
     print("")
     print("========================================")
     print("       LIDAR WEB DASHBOARD")
@@ -292,7 +330,8 @@ def main():
 
     ingest = FrameIngestServer(hub, args.ingest_host, args.ingest_port)
     ingest.start()
-    map_ingest = MapIngestServer(map_hub, args.ingest_host, args.map_port)
+    map_ingest = MapIngestServer(map_hub, args.ingest_host, args.map_port,
+                                 on_new_session=lambda _meta: dem_hub.reset())
     map_ingest.start()
 
     tunnel = CloudflareTunnel(port=args.port, disabled=args.no_tunnel,
@@ -302,7 +341,7 @@ def main():
     print("[lidar-web] dashboard:  http://%s:%d" % (args.host, args.port))
     print("[lidar-web] live ingest: tcp://%s:%d (ROS bridge)" %
           (args.ingest_host, args.ingest_port))
-    print("[lidar-web] map ingest:  tcp://%s:%d (FAST-LIO2 exporter, loopback only)" %
+    print("[lidar-web] map ingest:  tcp://%s:%d (SLAM exporter, loopback only)" %
           (args.ingest_host, args.map_port))
     print("[lidar-web] websocket:  /ws/points, /ws/map, /ws/dem")
     print_banner(args.port, tunnel)
@@ -317,7 +356,30 @@ def main():
             ingest.stop()
 
 
+def _ascii_safe_stdout():
+    """Never let a non-ASCII glyph kill the backend.
+
+    Python 3.6 has no sys.stdout.reconfigure(), and a POSIX/C locale (root
+    shells, systemd units, cron) decodes stdout as ASCII -- printing one
+    non-ASCII character then raises UnicodeEncodeError and takes the whole
+    dashboard down.  Re-wrap the stream as UTF-8 and never fail on encode.
+    """
+    stream = getattr(sys.stdout, "buffer", None)
+    if stream is None:
+        return
+    try:
+        import io
+        sys.stdout = io.TextIOWrapper(stream, encoding="utf-8",
+                                      errors="replace", line_buffering=True)
+        if getattr(sys.stderr, "buffer", None) is not None:
+            sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8",
+                                          errors="replace", line_buffering=True)
+    except (ValueError, OSError):
+        pass
+
+
 if __name__ == "__main__":
+    _ascii_safe_stdout()
     try:
         main()
     except KeyboardInterrupt:

@@ -2,17 +2,22 @@
 # -*- coding: utf-8 -*-
 """ROS -> web bridge for live LiDAR point clouds.
 
-Subscribes to a sensor_msgs/PointCloud2 topic (default /livox/lidar) and
-forwards x, y, z, intensity for every point to the local Flask/WebSocket
-backend over a loopback TCP socket.
+Subscribes to a sensor_msgs/PointCloud2 topic and forwards x, y, z, intensity
+for every point to the local Flask/WebSocket backend over a loopback TCP
+socket.
+
+The topic is auto-detected when ``~topic`` is left empty, so Mid-360
+(``/mid360/livox/lidar``), legacy Livox (``/livox/lidar``), Ouster, Avia and
+Velodyne bags all work without arguments.  A missing topic now fails loudly
+instead of looking like a frozen dashboard.
 
 Runs on Python 2.7 because ROS Melodic's rospy only supports Python 2.
 The existing driver, RViz and topic pipeline are left untouched; this is an
 additional, read-only subscriber.
 
 Parameters (private):
-    ~topic        point-cloud topic            (default /livox/lidar)
-    ~imu_topic    IMU topic for health display (default /livox/imu)
+    ~topic        point-cloud topic            (default: auto-detect)
+    ~imu_topic    IMU topic for health display (default: auto-detect)
     ~server_host  web backend ingest host      (default 127.0.0.1)
     ~server_port  web backend ingest port      (default 8765)
     ~point_stride keep every Nth point         (default 1)
@@ -46,10 +51,170 @@ def log(message):
     rospy.loginfo("[lidar-web-bridge] " + message)
 
 
+# Candidate names, most specific first.  Any bag works as long as its cloud
+# topic carries sensor_msgs/PointCloud2, so this list is only a hint: the
+# keyword and message-type fallbacks in _pick() catch everything else.
+CLOUD_CANDIDATES = (
+    # Livox (Mid-360, Avia, Horizon, Tele-15, legacy)
+    "/livox/lidar", "/livox/lidar_custom", "/livox/lidar_raw",
+    "/livox/lidar_front", "/livox/lidar_left", "/livox/lidar_right",
+    "/livox/lidar_1", "/livox/lidar_2", "/livox/points",
+    "/livox/points_raw", "/livox_cloud", "/mid360/livox/lidar",
+    "/mid360/lidar", "/mid360/points", "/avia/livox/lidar",
+    "/horizon/livox/lidar", "/tele/livox/lidar",
+    # Ouster / Velodyne / Hesai / RoboSense / Leishen
+    "/ouster/points", "/os_cloud_node/points", "/os1_cloud_node/points",
+    "/velodyne_points", "/velodyne/points", "/velodyne_cloud",
+    "/hesai/points", "/rslidar_points", "/rslidar/points",
+    "/lslidar_point_cloud", "/velo_cloud", "/sensor_points",
+    # generic
+    "/points", "/points_raw", "/lidar_points", "/lidar/points",
+    "/cloud", "/lidar/cloud", "/scan_cloud", "/points_cloud",
+)
+IMU_CANDIDATES = (
+    "/livox/imu", "/livox/imu_raw", "/mid360/livox/imu", "/mid360/imu",
+    "/avia/livox/imu", "/horizon/livox/imu", "/ouster/imu",
+    "/imu", "/imu/data", "/imu/data_raw", "/imu_raw", "/imu/raw",
+    "/vn100/imu", "/gps/imu", "/vector/imu", "/imu_9dof",
+)
+# Topic-name fragments used when no candidate matches exactly.
+CLOUD_HINTS = ("livox", "mid360", "lidar", "velodyne", "ouster", "hesai",
+               "rslidar", "lslidar", "scan", "points", "cloud", "velo")
+FLOW_HINTS = ("imu", "ins", "vector", "vn100")
+
+
+# Topics this project publishes itself.  Picking one as the *input* cloud would
+# make the bridge or the odometry feed on its own output.
+SELF_TOPICS = ("/cloud_registered", "/Odometry", "/path", "/map",
+               "/cloud_registered_body")
+
+# sensor_msgs/PointField datatype codes.
+_ROS_FORMATS = {1: "i1", 2: "u1", 3: "i2", 4: "u2", 5: "i4", 6: "u4",
+                7: "f4", 8: "f8"}
+INTENSITY_NAMES = ("intensity", "intensities", "reflectivity",
+                   "reflectance", "refl", "power", "i")
+
+
+def _field_format(field):
+    """numpy format for one PointField, honouring its real datatype."""
+    base = _ROS_FORMATS.get(field.datatype)
+    if base is None:
+        raise ValueError("unsupported datatype %d for field %r"
+                         % (field.datatype, field.name))
+    if field.count > 1:
+        return ("<" + base, (field.count,))
+    return "<" + base
+
+
+def _raw_field(msg, field, count, name="v"):
+    dtype = np.dtype({"names": [name], "formats": [_field_format(field)],
+                      "offsets": [field.offset], "itemsize": msg.point_step})
+    return np.frombuffer(msg.data, dtype=dtype, count=count)[name]
+
+
+def _intensity(msg, fields, count):
+    """Intensity normalised to 0..255, or None when the cloud has none.
+
+    Handles ``intensity``/``reflectivity``-style scalars *and* the packed
+    colour float (``rgb``/``rgba``) that Velodyne converters and some Livox
+    exports publish instead, so Intensity colouring works for both.
+    """
+    for name in INTENSITY_NAMES:
+        if name not in fields:
+            continue
+        try:
+            values = _raw_field(msg, fields[name], count)
+        except ValueError:
+            continue
+        values = np.asarray(values, dtype=np.float64)
+        if values.ndim > 1:
+            values = values[:, 0]
+        if values.size == 0:
+            return None
+        peak = float(np.nanmax(values))
+        if peak > 0 and peak <= 1.5:          # 0..1 reflectance
+            values = values * 255.0
+        elif peak > 255.0:                    # 0..65535 or raw counts
+            values = values * (255.0 / peak)
+        return values
+    for name in ("rgb", "rgba"):
+        if name not in fields:
+            continue
+        field = fields[name]
+        if field.datatype not in (5, 6, 7):
+            continue
+        packed = _raw_field(msg, field, count)
+        if field.datatype == 7:               # float32 holding a packed uint32
+            packed = np.asarray(packed).view(np.uint32)
+        else:
+            packed = np.asarray(packed).astype(np.uint32)
+        red = (packed >> 16) & 0xFF
+        green = (packed >> 8) & 0xFF
+        blue = packed & 0xFF
+        return 0.299 * red + 0.587 * green + 0.114 * blue
+    return None
+
+
+def _published_topics():
+    try:
+        return dict(rospy.get_published_topics())
+    except Exception:  # noqa: BLE001 - mastership may not be ready yet
+        return {}
+
+
+def _pick_many(preferred, candidates, kind, hints=(), exclude=(), limit=6):
+    """Every topic that could feed us, best guess first.
+
+    Candidates win, then keyword matches, then any topic of the wanted type.
+    An explicit ``~topic`` is tried first but not exclusive, so a stale
+    parameter cannot leave the bridge deaf.  All of them are subscribed and the
+    first that delivers data wins.
+    """
+    available = _published_topics()
+    ordered = [preferred] if preferred else []
+    for name in candidates:
+        if name in available and kind in available[name]:
+            ordered.append(name)
+    for hint in hints:
+        for name in sorted(available):
+            if name in exclude or hint not in name.lower():
+                continue
+            if kind in available[name] and name not in ordered:
+                ordered.append(name)
+    for name in sorted(available):
+        if (name not in exclude and kind in available[name]
+                and name not in ordered):
+            ordered.append(name)
+    return ordered[:limit]
+
+
+def _pick(preferred, candidates, kind, hints=(), exclude=()):
+    """Single best topic (used for the optional IMU health topic)."""
+    found = _pick_many(preferred, candidates, kind, hints, exclude, limit=1)
+    if found:
+        return found[0], None
+    return None, "no %s topic found; published: %s" % (
+        kind, ", ".join(sorted(_published_topics().keys())) or "nothing")
+
+
 class PointCloudBridge(object):
     def __init__(self):
-        self.topic = rospy.get_param("~topic", "/livox/lidar")
-        self.imu_topic = rospy.get_param("~imu_topic", "/livox/imu")
+        self.explicit_topic = rospy.get_param("~topic", "")
+        self.topic = None
+        self.topic_error = None
+        self.subs = {}
+        self.rank = {}          # topic -> candidate priority (lower is better)
+        candidates = _pick_many(
+            self.explicit_topic, CLOUD_CANDIDATES,
+            "sensor_msgs/PointCloud2", CLOUD_HINTS, SELF_TOPICS)
+        if candidates:
+            log("cloud candidates: %s" % ", ".join(candidates))
+        else:
+            rospy.logwarn("[lidar-web-bridge] no PointCloud2 topic yet; "
+                          "waiting for one to appear")
+        self.imu_topic, _imu_error = _pick(
+            rospy.get_param("~imu_topic", ""), IMU_CANDIDATES,
+            "sensor_msgs/Imu", FLOW_HINTS)
         self.server_host = rospy.get_param("~server_host", "127.0.0.1")
         self.server_port = int(rospy.get_param("~server_port", 8765))
         self.point_stride = max(1, int(rospy.get_param("~point_stride", 1)))
@@ -76,22 +241,68 @@ class PointCloudBridge(object):
         self.meta.daemon = True
         self.meta.start()
 
-        self.subscriber = rospy.Subscriber(
-            self.topic,
-            PointCloud2,
-            self._on_cloud,
-            queue_size=1,
-            buff_size=2 ** 24,
-        )
-        self.imu_subscriber = rospy.Subscriber(
-            self.imu_topic, Imu, self._on_imu, queue_size=10)
-        log("subscribed to %s (sensor_msgs/PointCloud2)" % self.topic)
-        log("monitoring IMU %s (health only)" % self.imu_topic)
+        self._subscribe(candidates)
+        self.discovery = rospy.Timer(rospy.Duration(3.0), self._discover)
+        self.imu_subscriber = None
+        if self.imu_topic is not None:
+            self.imu_subscriber = rospy.Subscriber(
+                self.imu_topic, Imu, self._on_imu, queue_size=10)
+        log("subscribed to %s (sensor_msgs/PointCloud2)"
+            % (self.topic or "(waiting for a cloud topic)"))
+        if self.imu_topic is not None:
+            log("monitoring IMU %s (health only)" % self.imu_topic)
+        else:
+            log("no IMU topic found; IMU health will stay unknown")
         log("forwarding to tcp://%s:%d (stride=%d)"
             % (self.server_host, self.server_port, self.point_stride))
 
+    # -- topic discovery ------------------------------------------------
+    def _subscribe(self, candidates):
+        for topic in candidates:
+            if topic not in self.rank:
+                self.rank[topic] = len(self.rank)
+            if topic in self.subs:
+                continue
+            self.subs[topic] = rospy.Subscriber(
+                topic, PointCloud2,
+                lambda msg, t=topic: self._on_cloud(msg, t),
+                queue_size=1, buff_size=2 ** 24)
+
+    def _discover(self, _event=None):
+        if self.topic is not None:
+            # Several LiDARs may publish; for the first frames a better-ranked
+            # topic can still take over, then the extra subscriptions are cut.
+            if self.seq >= 5 and len(self.subs) > 1:
+                for name, sub in list(self.subs.items()):
+                    if name == self.topic:
+                        continue
+                    try:
+                        sub.unregister()
+                    except Exception:  # noqa: BLE001 - shutdown race
+                        pass
+                    self.subs.pop(name, None)
+            return
+        candidates = _pick_many(self.explicit_topic, CLOUD_CANDIDATES,
+                                "sensor_msgs/PointCloud2", CLOUD_HINTS,
+                                SELF_TOPICS)
+        if candidates:
+            log("subscribing to %s" % ", ".join(candidates))
+            self._subscribe(candidates)
+
     # -- ROS callback ---------------------------------------------------
-    def _on_cloud(self, msg):
+    def _on_cloud(self, msg, topic=None):
+        # Keep the first topic that really publishes and drop the rest.
+        if self.topic is None:
+            self.topic = topic
+            if self.topic_error is None:
+                log("locked onto cloud topic %s" % topic)
+        elif topic is not None and topic != self.topic:
+            current = self.rank.get(self.topic, 1 << 30)
+            if self.seq < 5 and self.rank.get(topic, 1 << 30) < current:
+                log("preferring %s over %s" % (topic, self.topic))
+                self.topic = topic
+            else:
+                return
         try:
             points = self._extract(msg)
         except Exception as exc:  # noqa: BLE001 - never kill the subscriber
@@ -152,9 +363,12 @@ class PointCloudBridge(object):
         else:
             step = self.point_stride
 
-        offsets = [fields[name].offset for name in ONLY_FIELDS if name in fields]
-        formats = ["<f4" for _ in ONLY_FIELDS if name in fields]
+        # Build one list per dtype key.  (The previous version used a
+        # comprehension whose loop variable leaked in Python 2, so ``formats``
+        # could be shorter than ``names`` and numpy rejected every frame.)
         names = [name for name in ONLY_FIELDS if name in fields]
+        offsets = [fields[name].offset for name in names]
+        formats = [_field_format(fields[name]) for name in names]
         dtype = np.dtype({
             "names": names,
             "formats": formats,
@@ -169,16 +383,17 @@ class PointCloudBridge(object):
         out[:, 0] = sliced["x"]
         out[:, 1] = sliced["y"]
         out[:, 2] = sliced["z"]
-        if "intensity" in fields:
-            np.clip(sliced["intensity"], 0.0, 255.0, out=out[:, 3])
-        else:
+        intensity = _intensity(msg, fields, count)
+        if intensity is None:
             out[:, 3] = 0.0
+        else:
+            np.clip(intensity[::step], 0.0, 255.0, out=out[:, 3])
         return out
 
     # -- TCP sender -----------------------------------------------------
     def _hello_bytes(self):
         hello = {
-            "topic": self.topic,
+            "topic": self.topic or "(waiting)",
             "message_type": "sensor_msgs/PointCloud2",
             "frame_id": "",
             "master_uri": os.environ.get("ROS_MASTER_URI", ""),

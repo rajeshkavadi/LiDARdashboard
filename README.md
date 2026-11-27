@@ -28,6 +28,8 @@ cd ~/LiDARdashboard
 ./scripts/start_all.sh --bag              # full stack + replay the default bag
 ./scripts/start_all.sh /path/to/other.bag # full stack + replay that bag
 ./scripts/start_all.sh --bag=/path/other.bag
+./scripts/start_all.sh --file /path/to/clip_folder  # full stack + stitch the
+                                                   # clips into one replay
 ./scripts/start_all.sh --help
 ```
 
@@ -66,6 +68,56 @@ root, `~` expands, and a path that does not exist stops the script with
 once and the stack shuts down when it ends; set `BAG_LOOP=--loop` to keep it
 repeating until `Ctrl-C`. Other `rosbag play` options are not forwarded by
 `start_all.sh` — run `scripts/play_bag.sh` directly for those.
+
+### Sequential clips from an edge device
+
+When the recorder uploads one long run as short segments (typically 10 s
+`.bag` files in one directory), point `--file` at that directory instead of at
+a single bag:
+
+```bash
+./scripts/start_all.sh --file /home/rajesh/sensor_recording/lidar_data
+./scripts/start_all.sh --file=/path/to/clip_folder
+./scripts/start_all.sh --file            # LIDAR_BAG_DIR, default
+                                         # /home/rajesh/sensor_recording/lidar_data
+```
+
+The clips are first **stitched into one bag** (`tools/stitch_clips.py`) on a
+single continuous timeline and that bag is then replayed once, so the SLAM
+stack sees exactly the stream it would have seen from one long recording: the
+LiDAR publisher never disappears, there is no `rosbag play` restart between
+clips, and the LIVE view, GLOBAL MAP, trajectory and DEM tiles simply keep
+going. The merged bag is cached, so a repeated run starts immediately.
+
+```
+play_bag: stitching 46 clips into one continuous bag ...
+play_bag: 1 clip(s) stitched into one bag: 41bd….bag
+play_bag: one continuous timeline (no clip boundaries, no dead time)
+```
+
+- Replaying the files separately (`BAG_STITCH=0`) is *not* equivalent: each
+  clip boundary becomes a publisher gap plus a multi-second hole in the sensor
+  stream that the odometry has to jump over, which smears the map.
+- The stitcher logs the **dead time** it removed between two clips. In this
+  recorder it is ~1.7 s per 10 s clip (`dead time 1.68 s -> 0.02 s`): that
+  data was never written by `record_sensors.sh`, because it stops and restarts
+  `rosbag record` for every segment. The seam itself is configurable with
+  `LIDAR_STITCH_GAP` (seconds, default `0.02`); `0` joins them back to back.
+- `LIDAR_STITCH_CACHE` (default `/tmp/lidar_stitch`) holds the merged bag;
+  `BAG_STITCH_FORCE=1` rebuilds it. The cache key covers clip path, size and
+  mtime, so re-uploaded or replaced clips are picked up automatically. The
+  merged bag is roughly the size of the clips themselves (a 46-clip session is
+  ~2.3 GB); if there is not enough free space the player falls back to
+  clip-by-clip playback with a warning.
+- A damaged or still-uploading clip makes the stitch step fail; the player then
+  falls back to playing each clip as before, so a bad clip costs only that
+  clip instead of the whole session.
+- Clips must be sorted by filename, which the recorder's timestamped names
+  (`lidar_20261126_200111_0.bag`) already are; `clip2` sorts before `clip10`.
+- Only the top level of the directory is scanned (`*.bag`, symlinks included).
+- `BAG_LOOP=--loop` repeats the whole stitched session; `Ctrl-C` stops it.
+- `scripts/play_bag.sh --folder <dir>` replays a folder on its own, for use with
+  individually started components.
 
 Remote access needs `cloudflared` in `PATH` (section 8.1). Without it the
 banner prints `CLOUDFLARE STATUS: CLOUDFLARED NOT INSTALLED` and the dashboard
@@ -709,6 +761,7 @@ drifts on long loops, which is why FAST-LIO2 stays a first-class option.
 ./scripts/start_all.sh --bag          # plus bag replay (first .bag in repo root)
 ./scripts/start_all.sh /path/to/x.bag # plus replay of a specific bag
 ./scripts/start_all.sh --bag=/path/to/x.bag
+./scripts/start_all.sh --file /path/to/clip_folder  # clip folder -> stitched replay
 ./scripts/start_all.sh --help         # argument summary
 
 # components individually
@@ -717,6 +770,7 @@ drifts on long loops, which is why FAST-LIO2 stays a first-class option.
 ./scripts/start_slam.sh               # SLAM + exporter (tcp 8766)
 ./scripts/start_dem.sh                # incremental DEM worker
 ./scripts/play_bag.sh                 # auto-finds the .bag in the repo root
+./scripts/play_bag.sh --folder DIR    # stitch every .bag in DIR, play it once
 
 # use FAST-LIO2 (or any other backend) instead of the bundled odometry
 SLAM_BACKEND=external SLAM_NAME=fast-lio2 ./scripts/start_slam.sh
@@ -778,6 +832,10 @@ the full cloud — a 167k-point/frame bag still runs at ~10 fps.
 | `DESKEW` | `1` | per-point motion compensation |
 | `DEM_RESOLUTION` | `0.5` | DEM cell size (m) |
 | `LIDAR_DEM_DIR` | `/tmp/lidar_dem` | exports directory |
+| `LIDAR_BAG_DIR` | `/home/rajesh/sensor_recording/lidar_data` | folder a bare `--file` replays |
+| `LIDAR_STITCH_GAP` | `0.02` | seam (s) between two clips in the stitched bag |
+| `LIDAR_STITCH_CACHE` | `/tmp/lidar_stitch` | where the stitched session bag is cached |
+| `BAG_STITCH` | `1` | `0` plays clips one by one instead of stitching them |
 | `LIDAR_PDAL_BIN` | auto | explicit `pdal` binary |
 
 Odometry tuning is exposed as private ROS params: `~voxel_size` (0.35),

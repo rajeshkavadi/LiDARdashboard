@@ -15,20 +15,35 @@
 #   scripts/start_all.sh --bag            # ... and replay the default bag
 #   scripts/start_all.sh /path/to/x.bag   # ... and replay that bag
 #   scripts/start_all.sh --bag=/path/x.bag
+#   scripts/start_all.sh --file /path/dir # ... and replay the clips in dir
+#   scripts/start_all.sh --file           # ... from $LIDAR_BAG_DIR
 #   NO_TUNNEL=1 scripts/start_all.sh      # skip the Cloudflare tunnel
 #   NO_SLAM=1 / NO_DEM=1 / NO_BRIDGE=1 to leave a component out
 #
 # A bag is played once.  When it reaches the end, every component is stopped
 # and the script exits; Ctrl-C stops everything earlier.
+#
+# A folder of short clips (e.g. 10 s segments uploaded by an edge device) is
+# stitched into one bag on a continuous timeline (scripts/play_bag.sh, tools/
+# stitch_clips.py) and replayed once, so the dashboard, global map, trajectory
+# and DEM accumulate as if the whole run had arrived as one bag -- which is
+# what the SLAM and DEM components need.  `--folder` is an alias for `--file`.
 set -e
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$HERE"
 
+# Folder used by a bare `--file` when LIDAR_BAG_DIR is not set: the directory
+# the edge device uploads its short clips into on this machine.
+DEFAULT_BAG_DIR="${LIDAR_BAG_DIR:-/home/rajesh/sensor_recording/lidar_data}"
+
 usage() {
-  echo "usage: $0 [--bag | --bag=<file> | <file.bag>] [--help]" >&2
+  echo "usage: $0 [--bag | --bag=<file> | <file.bag> | --file <dir>] [--help]" >&2
   echo "  (no argument)       live LiDAR" >&2
   echo "  --bag               replay the first .bag in $HERE (once)" >&2
   echo "  <file.bag>          replay that bag (also --bag=<file>)" >&2
+  echo "  --file <dir>        stitch the .bag files in <dir> into one continuous run" >&2
+  echo "  --file              same, for $DEFAULT_BAG_DIR" >&2
+  echo "  --file=<dir>        (--folder is an alias for --file)" >&2
   echo "  env: NO_TUNNEL=1 NO_DEM=1 NO_SLAM=1 NO_BRIDGE=1 BAG_LOOP=--loop" >&2
 }
 
@@ -47,6 +62,8 @@ fi
 
 PLAY_BAG=0
 BAG_PATH=""
+BAG_DIR=""
+DIR_REQUESTED=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --bag)
@@ -55,6 +72,23 @@ while [ $# -gt 0 ]; do
     --bag=*)
       PLAY_BAG=1
       BAG_PATH="${1#*=}"
+      ;;
+    --file|--folder)
+      PLAY_BAG=1
+      DIR_REQUESTED=1
+      # `--file <dir>` takes the next argument when it is a path; a bare
+      # `--file` (or one followed by another option) uses the default folder.
+      if [ $# -ge 2 ] && [ "${2#-}" = "$2" ]; then
+        BAG_DIR="$2"
+        shift
+      else
+        BAG_DIR="${LIDAR_BAG_DIR:-$DEFAULT_BAG_DIR}"
+      fi
+      ;;
+    --file=*|--folder=*)
+      PLAY_BAG=1
+      DIR_REQUESTED=1
+      BAG_DIR="${1#*=}"
       ;;
     -h|--help)
       usage
@@ -75,6 +109,26 @@ while [ $# -gt 0 ]; do
 done
 
 BAG_ARGS=()
+if [ "$DIR_REQUESTED" = 1 ]; then
+  case "$BAG_DIR" in
+    "~"/*) BAG_DIR="$HOME/${BAG_DIR#\~/}" ;;
+    /*) ;;                      # absolute, use as given
+    *) BAG_DIR="$(pwd)/$BAG_DIR" ;;
+  esac
+  if [ ! -d "$BAG_DIR" ]; then
+    echo "start_all: folder not found: $BAG_DIR" >&2
+    usage
+    exit 2
+  fi
+  CLIPS=$(find "$BAG_DIR" -maxdepth 1 \( -type f -o -type l \) -name '*.bag' -print | wc -l | tr -d ' ')
+  if [ "$CLIPS" = 0 ]; then
+    echo "start_all: no .bag files in $BAG_DIR" >&2
+    exit 2
+  fi
+  BAG_PATH=""
+  BAG_ARGS+=(--folder "$BAG_DIR")
+  echo "start_all: folder playback: $CLIPS clip(s) from $BAG_DIR"
+fi
 if [ -n "$BAG_PATH" ]; then
   case "$BAG_PATH" in
     "~"/*) BAG_PATH="$HOME/${BAG_PATH#\~/}" ;;
@@ -175,7 +229,11 @@ fi
 
 # Playback goes first so its topics exist before the ROS nodes look for them.
 if [ "$PLAY_BAG" = "1" ]; then
-  echo "== bag playback =="
+  if [ "$DIR_REQUESTED" = 1 ]; then
+    echo "== clip playback (stitched) =="
+  else
+    echo "== bag playback =="
+  fi
   "$HERE/scripts/play_bag.sh" "${BAG_ARGS[@]}" &
   BAG_PID="$!"
   PIDS+=("$BAG_PID")
@@ -197,12 +255,20 @@ fi
 echo
 echo "dashboard: http://127.0.0.1:${LIDAR_WEB_PORT:-5000}/"
 if [ -n "$BAG_PID" ]; then
-  echo "the bag plays once; everything stops when it ends (Ctrl+C to stop early)"
+  if [ "$DIR_REQUESTED" = 1 ]; then
+    echo "the clips play as one continuous run; everything stops at its end"
+  else
+    echo "the bag plays once; everything stops when it ends (Ctrl+C to stop early)"
+  fi
   # Wait only for the playback: when the recording is over there is nothing
   # left to show, so the whole stack is torn down by the EXIT trap.
   wait "$BAG_PID" 2>/dev/null || true
   echo
-  echo "[start_all] bag finished; stopping the dashboard, bridge, SLAM and DEM"
+  if [ "$DIR_REQUESTED" = 1 ]; then
+    echo "[start_all] clip sequence finished; stopping the dashboard, bridge, SLAM and DEM"
+  else
+    echo "[start_all] bag finished; stopping the dashboard, bridge, SLAM and DEM"
+  fi
   exit 0
 fi
 echo "press Ctrl+C to stop everything"

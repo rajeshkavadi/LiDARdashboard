@@ -212,9 +212,9 @@ class PointCloudBridge(object):
         else:
             rospy.logwarn("[lidar-web-bridge] no PointCloud2 topic yet; "
                           "waiting for one to appear")
+        self.explicit_imu = rospy.get_param("~imu_topic", "")
         self.imu_topic, _imu_error = _pick(
-            rospy.get_param("~imu_topic", ""), IMU_CANDIDATES,
-            "sensor_msgs/Imu", FLOW_HINTS)
+            self.explicit_imu, IMU_CANDIDATES, "sensor_msgs/Imu", FLOW_HINTS)
         self.server_host = rospy.get_param("~server_host", "127.0.0.1")
         self.server_port = int(rospy.get_param("~server_port", 8765))
         self.point_stride = max(1, int(rospy.get_param("~point_stride", 1)))
@@ -252,7 +252,10 @@ class PointCloudBridge(object):
         if self.imu_topic is not None:
             log("monitoring IMU %s (health only)" % self.imu_topic)
         else:
-            log("no IMU topic found; IMU health will stay unknown")
+            # Common at startup when the bridge is up before a recorder or a
+            # `rosbag play` publishes anything: keep looking instead of giving
+            # up, otherwise the dashboard shows "no IMU" for the whole run.
+            log("no IMU topic yet; will keep looking")
         log("forwarding to tcp://%s:%d (stride=%d)"
             % (self.server_host, self.server_port, self.point_stride))
 
@@ -269,6 +272,7 @@ class PointCloudBridge(object):
                 queue_size=1, buff_size=2 ** 24)
 
     def _discover(self, _event=None):
+        self._discover_imu()
         if self.topic is not None:
             # Several LiDARs may publish; for the first frames a better-ranked
             # topic can still take over, then the extra subscriptions are cut.
@@ -288,6 +292,24 @@ class PointCloudBridge(object):
         if candidates:
             log("subscribing to %s" % ", ".join(candidates))
             self._subscribe(candidates)
+
+    def _discover_imu(self):
+        """Attach to an IMU topic once one exists (health display only)."""
+        if self.imu_topic is not None:
+            return
+        topic, _error = _pick(self.explicit_imu, IMU_CANDIDATES,
+                             "sensor_msgs/Imu", FLOW_HINTS)
+        if topic is None:
+            return
+        try:
+            self.imu_subscriber = rospy.Subscriber(
+                topic, Imu, self._on_imu, queue_size=10)
+        except Exception as exc:  # noqa: BLE001 - retried on the next tick
+            rospy.logwarn_throttle(30.0,
+                                   "[lidar-web-bridge] IMU subscribe failed: %s" % exc)
+            return
+        self.imu_topic = topic
+        log("monitoring IMU %s (health only)" % topic)
 
     # -- ROS callback ---------------------------------------------------
     def _on_cloud(self, msg, topic=None):

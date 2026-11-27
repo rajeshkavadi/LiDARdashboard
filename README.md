@@ -73,21 +73,52 @@ repeating until `Ctrl-C`. Other `rosbag play` options are not forwarded by
 
 When the recorder uploads one long run as short segments (typically 10 s
 `.bag` files in one directory), point `--file` at that directory instead of at
-a single bag:
+a single bag. `recording_scripts/record_sensors.sh` writes one folder per
+recording day, so the date folder and its `lidar_data/` are both accepted:
 
 ```bash
-./scripts/start_all.sh --file /home/rajesh/sensor_recording/lidar_data
+./scripts/start_all.sh --file ~/sensor_recording/2026-11-27          # that day's run
+./scripts/start_all.sh --file ~/sensor_recording/2026-11-27/lidar_data
 ./scripts/start_all.sh --file=/path/to/clip_folder
-./scripts/start_all.sh --file            # LIDAR_BAG_DIR, default
-                                         # /home/rajesh/sensor_recording/lidar_data
+./scripts/start_all.sh --file            # newest dated folder under
+                                         # ~/sensor_recording (LIDAR_BAG_DIR)
+./scripts/start_all.sh --file --follow   # folder still being written: stream it
 ```
 
-The clips are first **stitched into one bag** (`tools/stitch_clips.py`) on a
-single continuous timeline and that bag is then replayed once, so the SLAM
-stack sees exactly the stream it would have seen from one long recording: the
-LiDAR publisher never disappears, there is no `rosbag play` restart between
-clips, and the LIVE view, GLOBAL MAP, trajectory and DEM tiles simply keep
-going. The merged bag is cached, so a repeated run starts immediately.
+There are two playback modes for a folder:
+
+**Stitched** (default for a finished recording). The clips are merged into one
+bag (`tools/stitch_clips.py`) on a single continuous timeline and that bag is
+replayed once, so the SLAM stack sees exactly the stream it would have seen
+from one long recording: the LiDAR publisher never disappears, there is no
+`rosbag play` restart between clips, and the LIVE view, GLOBAL MAP, trajectory
+and DEM tiles simply keep going. The merged bag is cached, so a repeated run
+starts immediately. The catchment is the whole folder, so nothing is shown
+until the last clip has been merged — fine for an archive, useless while the
+device is still uploading.
+
+**Follow** (`--follow`, or automatically when a clip arrived less than
+`LIDAR_FOLLOW_WINDOW` seconds ago). Each clip is played as soon as its file is
+complete and the dashboard is already live when the next one lands: the live
+view runs about one clip (≈10 s) behind the sensor instead of waiting for the
+whole recording, and the SLAM/DEM processes are never restarted between clips.
+The stream ends after `LIDAR_FOLLOW_IDLE` seconds without a new clip. This is
+the mode for "the edge sends 10 s chunks, show me as it moves"; stitching the
+whole folder first would defeat exactly that purpose.
+
+```
+play_bag: streaming clips as they arrive (follow mode: 3 clip(s) so far)
+play_bag: SLAM keeps running across clip boundaries; stops after 30s without a new clip
+play_bag: new clip lidar_20261126_200134_0.bag
+play_bag: new clip lidar_20261126_200146_0.bag
+```
+
+For the map to stay continuous in follow mode the clips must be *slices of one
+stream*, not separate recordings: `recording_scripts/record_sensors.sh` now
+starts one `rosbag record --split --duration=<segment>` session for the whole
+run, so the seam between two files holds 5 ms of data, not 1.7 s of missing
+motion. Folders recorded with the older per-segment recorder still have that
+dead time baked in; stitch those (the default) to seal the seams.
 
 ```
 play_bag: stitching 46 clips into one continuous bag ...
@@ -95,13 +126,16 @@ play_bag: 1 clip(s) stitched into one bag: 41bd….bag
 play_bag: one continuous timeline (no clip boundaries, no dead time)
 ```
 
-- Replaying the files separately (`BAG_STITCH=0`) is *not* equivalent: each
-  clip boundary becomes a publisher gap plus a multi-second hole in the sensor
-  stream that the odometry has to jump over, which smears the map.
-- The stitcher logs the **dead time** it removed between two clips. In this
-  recorder it is ~1.7 s per 10 s clip (`dead time 1.68 s -> 0.02 s`): that
-  data was never written by `record_sensors.sh`, because it stops and restarts
-  `rosbag record` for every segment. The seam itself is configurable with
+- Replaying the files separately (`BAG_STITCH=0`) is *not* equivalent for a
+  folder recorded by the old per-segment recorder: each clip boundary becomes a
+  publisher gap plus a multi-second hole in the sensor stream that the odometry
+  has to jump over, which smears the map.
+- The stitcher logs the **dead time** it removed between two clips. With the
+  old recorder it is ~1.7 s per 10 s clip (`dead time 1.68 s -> 0.02 s`): that
+  data was never written, because the script stopped and restarted `rosbag
+  record` for every segment. `recording_scripts/record_sensors.sh` no longer
+  does that: it records one split session, so new clips have nothing to seal
+  and follow mode is continuous by itself. The seam is configurable with
   `LIDAR_STITCH_GAP` (seconds, default `0.02`); `0` joins them back to back.
 - `LIDAR_STITCH_CACHE` (default `/tmp/lidar_stitch`) holds the merged bag;
   `BAG_STITCH_FORCE=1` rebuilds it. The cache key covers clip path, size and
@@ -762,6 +796,7 @@ drifts on long loops, which is why FAST-LIO2 stays a first-class option.
 ./scripts/start_all.sh /path/to/x.bag # plus replay of a specific bag
 ./scripts/start_all.sh --bag=/path/to/x.bag
 ./scripts/start_all.sh --file /path/to/clip_folder  # clip folder -> stitched replay
+./scripts/start_all.sh --file /path/to/clip_folder --follow  # stream new clips
 ./scripts/start_all.sh --help         # argument summary
 
 # components individually
@@ -771,6 +806,7 @@ drifts on long loops, which is why FAST-LIO2 stays a first-class option.
 ./scripts/start_dem.sh                # incremental DEM worker
 ./scripts/play_bag.sh                 # auto-finds the .bag in the repo root
 ./scripts/play_bag.sh --folder DIR    # stitch every .bag in DIR, play it once
+./scripts/play_bag.sh --folder DIR --follow  # play clips as they land
 
 # use FAST-LIO2 (or any other backend) instead of the bundled odometry
 SLAM_BACKEND=external SLAM_NAME=fast-lio2 ./scripts/start_slam.sh
@@ -832,7 +868,10 @@ the full cloud — a 167k-point/frame bag still runs at ~10 fps.
 | `DESKEW` | `1` | per-point motion compensation |
 | `DEM_RESOLUTION` | `0.5` | DEM cell size (m) |
 | `LIDAR_DEM_DIR` | `/tmp/lidar_dem` | exports directory |
-| `LIDAR_BAG_DIR` | `/home/rajesh/sensor_recording/lidar_data` | folder a bare `--file` replays |
+| `LIDAR_BAG_DIR` | `~/sensor_recording` | root a bare `--file` picks the newest dated folder from |
+| `LIDAR_FOLLOW` | auto | `1` stream clips as they arrive, `0` always stitch |
+| `LIDAR_FOLLOW_IDLE` | `30` | follow mode ends after this many s without a new clip |
+| `LIDAR_FOLLOW_WINDOW` | `120` | a clip newer than this selects follow mode automatically |
 | `LIDAR_STITCH_GAP` | `0.02` | seam (s) between two clips in the stitched bag |
 | `LIDAR_STITCH_CACHE` | `/tmp/lidar_stitch` | where the stitched session bag is cached |
 | `BAG_STITCH` | `1` | `0` plays clips one by one instead of stitching them |

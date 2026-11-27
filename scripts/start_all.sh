@@ -16,6 +16,7 @@
 #   scripts/start_all.sh /path/to/x.bag   # ... and replay that bag
 #   scripts/start_all.sh --bag=/path/x.bag
 #   scripts/start_all.sh --file /path/dir # ... and replay the clips in dir
+#   scripts/start_all.sh --file --follow  # ... and stream clips as they arrive
 #   scripts/start_all.sh --file           # ... from $LIDAR_BAG_DIR
 #   NO_TUNNEL=1 scripts/start_all.sh      # skip the Cloudflare tunnel
 #   NO_SLAM=1 / NO_DEM=1 / NO_BRIDGE=1 to leave a component out
@@ -23,18 +24,49 @@
 # A bag is played once.  When it reaches the end, every component is stopped
 # and the script exits; Ctrl-C stops everything earlier.
 #
-# A folder of short clips (e.g. 10 s segments uploaded by an edge device) is
-# stitched into one bag on a continuous timeline (scripts/play_bag.sh, tools/
+# A folder of short clips (e.g. 10 s segments written by record_sensors.sh, one
+# dated folder per recording day) is stitched into one bag on a continuous timeline (scripts/play_bag.sh, tools/
 # stitch_clips.py) and replayed once, so the dashboard, global map, trajectory
 # and DEM accumulate as if the whole run had arrived as one bag -- which is
 # what the SLAM and DEM components need.  `--folder` is an alias for `--file`.
+#
+# Add --follow when the folder is still being written: each clip is then played
+# as soon as it lands (the SLAM nodes stay up between clips) instead of waiting
+# for a stitch of the whole recording.  It is chosen automatically when a clip
+# arrived less than LIDAR_FOLLOW_WINDOW (default 120) seconds ago.
 set -e
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$HERE"
 
-# Folder used by a bare `--file` when LIDAR_BAG_DIR is not set: the directory
-# the edge device uploads its short clips into on this machine.
-DEFAULT_BAG_DIR="${LIDAR_BAG_DIR:-/home/rajesh/sensor_recording/lidar_data}"
+# Folder used by a bare `--file`: the newest dated recording folder written by
+# record_sensors.sh (~/sensor_recording/<YYYY-MM-DD>/lidar_data), falling back
+# to the old flat layout.  LIDAR_BAG_DIR overrides it.
+default_bag_dir() {
+  local base="${LIDAR_BAG_DIR:-$HOME/sensor_recording}" d
+  if [ -n "${LIDAR_BAG_DIR:-}" ]; then
+    echo "$LIDAR_BAG_DIR"
+    return
+  fi
+  while IFS= read -r d; do
+    if [ -n "$(find "$d" -maxdepth 2 \( -type f -o -type l \) -name '*.bag' -print -quit 2>/dev/null)" ]; then
+      echo "$d"
+      return
+    fi
+  done < <(find "$base" -maxdepth 1 -type d \
+             -name '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]' 2>/dev/null | LC_ALL=C sort -r)
+  echo "$base/lidar_data"
+}
+
+# Clips are counted one level down too, so a dated folder works as well as the
+# lidar_data folder inside it.
+count_clips() {
+  local n
+  n=$(find "$1" -maxdepth 1 \( -type f -o -type l \) -name '*.bag' -print | wc -l | tr -d ' ')
+  if [ "$n" = 0 ]; then
+    n=$(find "$1" -maxdepth 2 \( -type f -o -type l \) -name '*.bag' -print | wc -l | tr -d ' ')
+  fi
+  echo "$n"
+}
 
 usage() {
   echo "usage: $0 [--bag | --bag=<file> | <file.bag> | --file <dir>] [--help]" >&2
@@ -42,9 +74,12 @@ usage() {
   echo "  --bag               replay the first .bag in $HERE (once)" >&2
   echo "  <file.bag>          replay that bag (also --bag=<file>)" >&2
   echo "  --file <dir>        stitch the .bag files in <dir> into one continuous run" >&2
-  echo "  --file              same, for $DEFAULT_BAG_DIR" >&2
-  echo "  --file=<dir>        (--folder is an alias for --file)" >&2
+  echo "  --file --follow     stream the clips in <dir> as they arrive (live-ish)" >&2
+  echo "  --file --no-follow  always stitch, even if the folder is still growing" >&2
+  echo "  --file              same, for the newest folder in ~/sensor_recording" >&2
+  echo "  --file=<dir>        a dated folder or its lidar_data/ both work" >&2
   echo "  env: NO_TUNNEL=1 NO_DEM=1 NO_SLAM=1 NO_BRIDGE=1 BAG_LOOP=--loop" >&2
+  echo "       LIDAR_FOLLOW=1/0 LIDAR_FOLLOW_IDLE=30 LIDAR_FOLLOW_WINDOW=120" >&2
 }
 
 if [ -f /opt/ros/melodic/setup.bash ]; then
@@ -64,8 +99,15 @@ PLAY_BAG=0
 BAG_PATH=""
 BAG_DIR=""
 DIR_REQUESTED=0
+FOLLOW_ARGS=()
 while [ $# -gt 0 ]; do
   case "$1" in
+    --follow)
+      FOLLOW_ARGS+=(--follow)
+      ;;
+    --no-follow|--stitch)
+      FOLLOW_ARGS+=(--no-follow)
+      ;;
     --bag)
       PLAY_BAG=1
       ;;
@@ -82,7 +124,7 @@ while [ $# -gt 0 ]; do
         BAG_DIR="$2"
         shift
       else
-        BAG_DIR="${LIDAR_BAG_DIR:-$DEFAULT_BAG_DIR}"
+        BAG_DIR="$(default_bag_dir)"
       fi
       ;;
     --file=*|--folder=*)
@@ -120,13 +162,14 @@ if [ "$DIR_REQUESTED" = 1 ]; then
     usage
     exit 2
   fi
-  CLIPS=$(find "$BAG_DIR" -maxdepth 1 \( -type f -o -type l \) -name '*.bag' -print | wc -l | tr -d ' ')
+  CLIPS=$(count_clips "$BAG_DIR")
   if [ "$CLIPS" = 0 ]; then
-    echo "start_all: no .bag files in $BAG_DIR" >&2
+    echo "start_all: no .bag files in $BAG_DIR (or in its lidar_data/ subfolder)" >&2
     exit 2
   fi
   BAG_PATH=""
   BAG_ARGS+=(--folder "$BAG_DIR")
+  BAG_ARGS+=("${FOLLOW_ARGS[@]}")
   echo "start_all: folder playback: $CLIPS clip(s) from $BAG_DIR"
 fi
 if [ -n "$BAG_PATH" ]; then
@@ -230,7 +273,7 @@ fi
 # Playback goes first so its topics exist before the ROS nodes look for them.
 if [ "$PLAY_BAG" = "1" ]; then
   if [ "$DIR_REQUESTED" = 1 ]; then
-    echo "== clip playback (stitched) =="
+    echo "== clip playback (stitched or streamed as clips arrive) =="
   else
     echo "== bag playback =="
   fi

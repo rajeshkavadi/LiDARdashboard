@@ -3,13 +3,32 @@
 # record_sensors.sh
 # -----------------------------------------------------------------------------
 # Segmented recording of:
-#   * u-blox 7 raw NMEA      -> ~/sensor_recording/gps_data/gps_<date_time>.txt
-#   * Livox MID-360S LiDAR+IMU -> ~/sensor_recording/lidar_data/lidar_<date_time>.bag
+#   * u-blox 7 raw NMEA      -> ~/sensor_recording/<YYYY-MM-DD>/gps_data/gps_<date_time>.txt
+#   * Livox MID-360S LiDAR+IMU -> ~/sensor_recording/<YYYY-MM-DD>/lidar_data/lidar_<date_time>.bag
 #
-# One segment = SEGMENT_SECONDS (default 10 s). The loop keeps creating new
-# timestamped file PAIRS until you press Ctrl+C. Both files of one segment use
-# the SAME timestamp tag, so gps_20261126_220000.txt belongs to
-# lidar_20261126_220000.bag -- handy for later fusion.
+# Everything from one recording day goes into one dated folder, so a new run
+# never mixes with the previous day's data:
+#
+#   ~/sensor_recording/
+#     2026-11-27/
+#       lidar_data/lidar_2026-11-27-14-03-11_0.bag ...
+#       gps_data/gps_20261127_140311.txt ...
+#       segments_<HHMMSS>.csv, recording_<HHMMSS>.log
+#
+# That dated folder is what you hand to scripts/start_all.sh --file later (it
+# looks into lidar_data/ itself).
+#
+# LiDAR/IMU: ONE continuous `rosbag record` session for the whole run, split by
+# rosbag itself into SEGMENT_SECONDS (default 10 s) files.  The split files are
+# consecutive slices of one uninterrupted stream: nothing is stopped between
+# them, so there is no dead time at a seam and replaying them back to back is
+# the same as replaying one long bag (the dashboard's global map then stays
+# continuous instead of smearing, which is what the old per-segment
+# stop/restart of rosbag caused: ~1.7 s of unrecorded motion per file).
+#
+# GPS: still one file per segment, gps_<YYYYMMDD_HHMMSS>.txt.  Only the GPS
+# files follow the segment tag naming; bag names come from rosbag itself,
+# lidar_<YYYY-MM-DD-HH-MM-SS>.bag, in the order they were written.
 #
 # Tested target: Ubuntu 18.04 + ROS Melodic + livox_ros_driver2 + u-blox 7.
 #
@@ -25,7 +44,7 @@
 #
 # Environment overrides (upper-case names mirror the long options):
 #   SEGMENT_SECONDS, GPS_DEV, NET_IFACE, LIDAR_IP, LOCAL_IP,
-#   ROS_SETUP, LIVOX_WS_SETUP, LIVOX_LAUNCH, TOPICS
+#   ROS_SETUP, LIVOX_WS_SETUP, LIVOX_LAUNCH, TOPICS, OUTPUT_DIR, SESSION_DATE
 #
 # NOTE: run with sudo for the IP/GPSD setup. The output directory is always
 # resolved against the *invoking* user's home, even when sudo changes ~ to /root.
@@ -66,7 +85,8 @@ record_sensors.sh -- segmented u-blox GPS + Livox MID-360S recorder
       --iface IF       ethernet interface to the LiDAR (default: enp0s31f6)
       --lidar-ip IP    LiDAR IP (default: 192.168.1.193)
       --local-ip CIDR  laptop IP on that interface (default: 192.168.1.50/24)
-      --output-dir DIR root folder (default: ~/sensor_recording)
+      --output-dir DIR root folder (default: ~/sensor_recording/<today's date>)
+                       runs land in <DIR>/lidar_data and <DIR>/gps_data
       --launch NAME    livox_ros_driver2 launch file (default: rviz_MID360s.launch)
       --topics "..."   space separated topics (default: "/livox/lidar /livox/imu")
       --no-gps         skip GPS recording
@@ -120,11 +140,16 @@ fi
 
 # expand a leading ~ in --output-dir against the real home
 OUTPUT_DIR="${OUTPUT_DIR/#\~/$REAL_HOME}"
-OUTPUT_ROOT="${OUTPUT_DIR:-${REAL_HOME}/sensor_recording}"
+# One folder per recording day, unless --output-dir says otherwise.
+SESSION_DATE="${SESSION_DATE:-$(date +%F)}"
+OUTPUT_ROOT="${OUTPUT_DIR:-${REAL_HOME}/sensor_recording/${SESSION_DATE}}"
 GPS_DIR="${OUTPUT_ROOT}/gps_data"
 BAG_DIR="${OUTPUT_ROOT}/lidar_data"
-LOG_FILE="${OUTPUT_ROOT}/recording.log"
-MANIFEST="${OUTPUT_ROOT}/segments.csv"
+# Per-session names: recording twice in one day must not truncate the first
+# session's log or manifest.
+SESSION_STAMP="$(date +%H%M%S)"
+LOG_FILE="${OUTPUT_ROOT}/recording_${SESSION_STAMP}.log"
+MANIFEST="${OUTPUT_ROOT}/segments_${SESSION_STAMP}.csv"
 
 LIVOX_WS_SETUP="${LIVOX_WS_SETUP:-${REAL_HOME}/ws_livox/devel/setup.bash}"
 read -r -a TOPIC_ARR <<< "$TOPICS"
@@ -145,9 +170,9 @@ DRY RUN -- no hardware or ROS commands will be executed.
   Livox setup      : ${LIVOX_WS_SETUP}
   Livox launch     : ${LIVOX_LAUNCH}
   topics           : ${TOPICS}           (enabled: ${LIDAR_ENABLED})
-  output root      : ${OUTPUT_ROOT}
+  output root      : ${OUTPUT_ROOT}      (date folder: ${SESSION_DATE})
     gps files      : ${GPS_DIR}/gps_<YYYYMMDD_HHMMSS>.txt
-    bag files      : ${BAG_DIR}/lidar_<YYYYMMDD_HHMMSS>.bag
+    bag files      : ${BAG_DIR}/lidar_<YYYY-MM-DD-HH-MM-SS>.bag (one split session)
     manifest       : ${MANIFEST}
     log            : ${LOG_FILE}
 
@@ -202,6 +227,15 @@ info() { log "    [....] $*"; }
 mkdir -p "$GPS_DIR" "$BAG_DIR" || die "cannot create $OUTPUT_ROOT"
 printf 'index,timestamp,duration_s,gps_file,gps_bytes,gps_lines,bag_file,bag_bytes\n' > "$MANIFEST"
 : > "$LOG_FILE"
+
+# A second run on the same day would land in the same dated folder; the clips
+# would then replay as one run, so say it out loud instead of blending them
+# silently.  Use --output-dir to keep runs apart.
+existing_bags=$(find "$BAG_DIR" -maxdepth 1 -type f -name 'lidar_*.bag' | wc -l)
+if (( existing_bags > 0 )); then
+    warn "${existing_bags} clip(s) from an earlier run today are already in ${BAG_DIR}"
+    warn "they replay together with this run; use --output-dir to keep runs separate"
+fi
 
 log "=== recording session started (user: $REAL_USER, segment: ${SEGMENT_SECONDS}s) ==="
 
@@ -351,7 +385,58 @@ fi
 log "Recording ${SEGMENT_SECONDS}-second segments into $OUTPUT_ROOT"
 log "Press Ctrl+C at any time to finish the current segment and stop cleanly."
 
+# ------------------------- LiDAR: one continuous session --------------------
+# rosbag keeps ONE stream open for the whole run and writes a new file every
+# SEGMENT_SECONDS.  Because the recorder never stops, the next file starts
+# exactly where the previous one ended: the clip boundary is seamless, both for
+# the SLAM backend (same process, continuous stamps) and for the map.
+if (( LIDAR_ENABLED )); then
+    log "Starting one continuous rosbag session (new file every ${SEGMENT_SECONDS}s)"
+    info "bag files: ${BAG_DIR}/lidar_<date>-<time>.bag"
+    rosbag record --split --duration="${SEGMENT_SECONDS}" -o "$BAG_DIR/lidar" \
+        "${TOPIC_ARR[@]}" >>"$LOG_FILE" 2>&1 &
+    BAG_PID=$!
+    sleep 2
+    if kill -0 "$BAG_PID" 2>/dev/null; then
+        ok "rosbag recording (pid $BAG_PID), splitting every ${SEGMENT_SECONDS}s"
+        sleep 1
+        (( $(find "$BAG_DIR" -maxdepth 1 -name 'lidar_*' -newermt '-10 seconds' | wc -l) > 0 )) \
+            || warn "no bag file written yet -- check $LOG_FILE"
+    else
+        warn "rosbag record exited immediately -- see $LOG_FILE"
+        BAG_PID=""
+        RUNNING=0
+    fi
+fi
+
+# Bag files already reported in the manifest.
+declare -A SEEN_BAGS=()
+NEW_BAG_NAMES="-"; NEW_BAG_BYTES=0; NEW_BAG_COUNT=0
+
+# Add every bag file that appeared since the last pass to the manifest row.
+record_new_bags() {
+    local f bytes
+    NEW_BAG_NAMES="-"; NEW_BAG_BYTES=0; NEW_BAG_COUNT=0
+    for f in "$BAG_DIR"/lidar_*.bag; do
+        [[ -e "$f" ]] || continue
+        [[ -n "${SEEN_BAGS[$f]:-}" ]] && continue
+        SEEN_BAGS[$f]=1
+        bytes="$(stat -c %s "$f" 2>/dev/null || echo 0)"
+        (( bytes > 0 )) || warn "$(basename "$f") is empty -- check ${TOPICS}"
+        NEW_BAG_BYTES=$(( NEW_BAG_BYTES + bytes ))
+        NEW_BAG_COUNT=$(( NEW_BAG_COUNT + 1 ))
+        if [[ "$NEW_BAG_NAMES" == "-" ]]; then
+            NEW_BAG_NAMES="$f"
+        else
+            NEW_BAG_NAMES="${NEW_BAG_NAMES};${f}"
+        fi
+        log "  closed bag: $(basename "$f") (${bytes} B)"
+    done
+}
+
 # --------------------------- recording loop ---------------------------------
+# The loop only drives the GPS segments and keeps the manifest up to date; the
+# LiDAR recorder runs in the background for the whole session.
 while (( RUNNING )); do
     SEG_INDEX=$(( SEG_INDEX + 1 ))
     STAMP="$(date +%Y%m%d_%H%M%S)"
@@ -361,58 +446,50 @@ while (( RUNNING )); do
     while true; do
         tag="${STAMP}${suffix:+_${suffix}}"
         gps_file="${GPS_DIR}/gps_${tag}.txt"
-        bag_file="${BAG_DIR}/lidar_${tag}.bag"
-        [[ -e "$gps_file" || -e "$bag_file" || -e "${bag_file}.active" ]] || break
+        [[ -e "$gps_file" ]] || break
         suffix=$(( suffix + 1 ))
     done
 
     log "segment #${SEG_INDEX} @ ${tag}"
-
-    # rosbag is started first so it has time to initialise before gpspipe starts.
-    if (( LIDAR_ENABLED )); then
-        # --duration stops rosbag normally after N seconds; `timeout` is only a
-        # safety net in case rosbag hangs (3 s grace before it sends SIGINT).
-        timeout -s INT -k 5s $(( SEGMENT_SECONDS + 3 )) \
-            rosbag record --duration="${SEGMENT_SECONDS}" -O "$bag_file" "${TOPIC_ARR[@]}" \
-            >>"$LOG_FILE" 2>&1 &
-        BAG_PID=$!
-    fi
 
     if (( GPS_ENABLED )); then
         # stdbuf forces line-buffered writes so a SIGINT cannot truncate the tail.
         timeout -s INT -k 2s "${SEGMENT_SECONDS}" \
             stdbuf -oL -eL gpspipe -r >"$gps_file" 2>>"$LOG_FILE" &
         GPS_PID=$!
+        wait "$GPS_PID" 2>/dev/null || true
+        GPS_PID=""
+    else
+        # No GPS: just wait out the segment so the manifest has one row per bag.
+        sleep "$SEGMENT_SECONDS" &
+        GPS_PID=$!
+        wait "$GPS_PID" 2>/dev/null || true
+        GPS_PID=""
     fi
 
-    # Interrupted by the signal trap; children have already been told to stop.
-    if [[ -n "$BAG_PID" ]]; then wait "$BAG_PID" 2>/dev/null; fi
-    if [[ -n "$GPS_PID" ]]; then wait "$GPS_PID" 2>/dev/null; fi
-
-    # rosbag should rename .active -> .bag on clean exit; recover it if not.
-    if (( LIDAR_ENABLED )) && [[ -f "${bag_file}.active" && ! -f "$bag_file" ]]; then
-        mv "${bag_file}.active" "$bag_file"
-        warn "recovered ${bag_file}.active -> ${bag_file}"
+    if (( LIDAR_ENABLED )); then
+        if [[ -n "$BAG_PID" ]] && ! kill -0 "$BAG_PID" 2>/dev/null; then
+            warn "rosbag record stopped unexpectedly -- see $LOG_FILE"
+            RUNNING=0
+        fi
+        record_new_bags
+    else
+        NEW_BAG_NAMES="-"; NEW_BAG_BYTES=0; NEW_BAG_COUNT=0
     fi
 
-    gps_bytes=0; gps_lines=0; bag_bytes=0
+    gps_bytes=0; gps_lines=0
     if (( GPS_ENABLED )) && [[ -f "$gps_file" ]]; then
         gps_bytes="$(stat -c %s "$gps_file" 2>/dev/null || echo 0)"
         gps_lines="$(wc -l < "$gps_file" 2>/dev/null || echo 0)"
         (( gps_lines > 0 )) || warn "$gps_file is empty -- is the GPS antenna outside with a clear sky view?"
     fi
-    if (( LIDAR_ENABLED )) && [[ -f "$bag_file" ]]; then
-        bag_bytes="$(stat -c %s "$bag_file" 2>/dev/null || echo 0)"
-        (( bag_bytes > 0 )) || warn "$bag_file is empty -- check /livox/lidar and /livox/imu"
-    fi
 
     printf '%s,%s,%s,%s,%s,%s,%s,%s\n' \
         "$SEG_INDEX" "$tag" "$SEGMENT_SECONDS" \
         "$([ "$GPS_ENABLED" -eq 1 ] && echo "$gps_file" || echo '-')" "$gps_bytes" "$gps_lines" \
-        "$([ "$LIDAR_ENABLED" -eq 1 ] && echo "$bag_file" || echo '-')" "$bag_bytes" >> "$MANIFEST"
+        "$NEW_BAG_NAMES" "$NEW_BAG_BYTES" >> "$MANIFEST"
 
-    log "segment #${SEG_INDEX} done: gps=${gps_lines} lines/${gps_bytes} B, bag=${bag_bytes} B"
-    GPS_PID=""; BAG_PID=""
+    log "segment #${SEG_INDEX} done: gps=${gps_lines} lines/${gps_bytes} B, ${NEW_BAG_COUNT} bag file(s)/${NEW_BAG_BYTES} B"
 done
 
 # ------------------------------- shutdown -----------------------------------
@@ -420,6 +497,18 @@ trap - INT TERM
 log "Stopping helpers..."
 stop_pid "$BAG_PID"    "rosbag"
 stop_pid "$GPS_PID"    "gpspipe"
+
+# The last split file is still .bag.active until rosbag closes it; make sure the
+# final clip is usable (and listed) even if rosbag was force-stopped.
+if (( LIDAR_ENABLED )); then
+    for act in "$BAG_DIR"/lidar_*.bag.active; do
+        [[ -e "$act" ]] || continue
+        mv "$act" "${act%.active}"
+        warn "recovered $(basename "$act") -> $(basename "${act%.active}")"
+    done
+    record_new_bags
+    [[ "$NEW_BAG_COUNT" == 0 ]] || log "final bag file(s): ${NEW_BAG_COUNT}"
+fi
 stop_pid "$DRIVER_PID" "roslaunch (Livox driver)"
 stop_pid "$GPSD_PID"   "gpsd"
 
@@ -431,7 +520,7 @@ leftovers="$(find "$BAG_DIR" -maxdepth 1 -type f -name '*.active' | wc -l)"
 
 echo
 echo "==================== recording summary ===================="
-echo " output root : $OUTPUT_ROOT"
+echo " output root : $OUTPUT_ROOT  (${SESSION_DATE})"
 echo " GPS files   : ${gps_count}  (${gps_size})  in ${GPS_DIR}"
 echo " BAG files   : ${bag_count}  (${bag_size})  in ${BAG_DIR}"
 echo " manifest    : $MANIFEST"
